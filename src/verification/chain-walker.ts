@@ -686,7 +686,18 @@ export async function walkChain(
         ),
     }));
 
-    return { checks, dag: graph, path, commitments };
+    // Re-assemble path with parsed Transactions attached on off-chain
+    // nodes, so downstream verifiers (signature / script / etc.) can
+    // consume the parsed shape without reparsing the PSBTs.
+    const pathWithTx: DagNode[] = path.map((node) => {
+        const parsedTx = parsed.get(node.txid);
+        if (parsedTx) {
+            return { ...node, tx: parsedTx };
+        }
+        return node;
+    });
+
+    return { checks, dag: graph, path: pathWithTx, commitments };
 }
 
 /**

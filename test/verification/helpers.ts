@@ -129,6 +129,26 @@ export interface MockChainOptions {
     commitmentTxid?: string;
 }
 
+/**
+ * Flip a single byte in a PSBT base64 encoding (xor with `mask`).
+ * Used to synthesise tamper scenarios — byte offset is measured in
+ * decoded-bytes space, not base64 characters.
+ */
+export function tamperPsbtByte(
+    psbtBase64: string,
+    byteOffset: number,
+    mask = 0x80
+): string {
+    const bytes = base64.decode(psbtBase64);
+    if (byteOffset < 0 || byteOffset >= bytes.length) {
+        throw new Error(
+            `tamperPsbtByte: offset ${byteOffset} out of range (len ${bytes.length})`
+        );
+    }
+    bytes[byteOffset] ^= mask;
+    return base64.encode(bytes);
+}
+
 /** Fabricate a 64-char lowercase-hex txid from a numeric seed. */
 export function fakeCommitmentTxid(seed: number): string {
     const n = seed.toString(16).padStart(2, "0");

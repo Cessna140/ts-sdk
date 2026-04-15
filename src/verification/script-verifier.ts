@@ -87,16 +87,35 @@ function p2trXOnlyKey(script: Uint8Array): Uint8Array | null {
 }
 
 /**
- * Custom PSBT field keys the Ark protocol uses (registered in arkd's
- * codebase). The decoder treats any Ark-namespaced key NOT in this
- * list as UNSUPPORTED — prevents silent acceptance of future protocol
- * extensions we haven't reviewed.
+ * Ark protocol PSBT field key-type byte. Every Ark-namespaced
+ * unknown field uses this type (see `src/utils/unknownFields.ts`
+ * `ArkPsbtFieldKeyType`). The discriminator is the `key` bytes (UTF-8
+ * keyword), not the type byte.
  */
-const KNOWN_ARK_PSBT_FIELD_TYPES = new Set<number>([
-    0x00, // VtxoTaprootTree (per arkd's PSBT field registry)
-    0x01, // VtxoTreeExpiry
-    0x02, // ConditionWitness
-]);
+const ARK_PSBT_FIELD_KEY_TYPE = 222;
+
+/**
+ * Recognised Ark-namespaced key-bytes prefixes. Unknown fields with
+ * `type === 222` whose `key` starts with any of these are known Ark
+ * fields; anything else with type 222 emits an `ark.unknown-field`
+ * UNSUPPORTED row so future protocol additions surface in the trace
+ * rather than being silently ignored. Encoded via UTF-8 per
+ * `encodedPsbtFieldKey` in `unknownFields.ts`.
+ */
+const KNOWN_ARK_KEY_PREFIXES: readonly string[] = [
+    "taptree", // VtxoTaprootTree
+    "expiry", // VtxoTreeExpiry
+    "cosigner", // CosignerPublicKey (cosigner + 1-byte index)
+    "condition", // ConditionWitness
+];
+
+function keyStartsWith(keyBytes: Uint8Array, prefix: string): boolean {
+    if (keyBytes.length < prefix.length) return false;
+    for (let i = 0; i < prefix.length; i++) {
+        if (keyBytes[i] !== prefix.charCodeAt(i)) return false;
+    }
+    return true;
+}
 
 /**
  * Decode a minimal taptree from the `VtxoTaprootTree` PSBT field.
@@ -148,29 +167,39 @@ function collectUnknownArkFieldErrors(
         const inp = tx.getInput(j);
         const unknownMap = (inp as { unknown?: unknown }).unknown;
         if (!unknownMap) continue;
-        const entries: Array<[unknown, Uint8Array]> = Array.isArray(unknownMap)
-            ? (unknownMap as Array<[unknown, Uint8Array]>)
-            : [];
+        const entries: Array<[{ type: number; key: Uint8Array }, Uint8Array]> =
+            Array.isArray(unknownMap)
+                ? (unknownMap as Array<
+                      [{ type: number; key: Uint8Array }, Uint8Array]
+                  >)
+                : [];
         for (const [keyDescriptor] of entries) {
-            const fieldType = extractFieldType(keyDescriptor);
-            if (fieldType === null) continue;
-            if (!KNOWN_ARK_PSBT_FIELD_TYPES.has(fieldType)) {
+            if (
+                !keyDescriptor ||
+                keyDescriptor.type !== ARK_PSBT_FIELD_KEY_TYPE ||
+                !(keyDescriptor.key instanceof Uint8Array)
+            )
+                continue;
+            const matches = KNOWN_ARK_KEY_PREFIXES.some((p) =>
+                keyStartsWith(keyDescriptor.key, p)
+            );
+            if (!matches) {
+                const keyPreview = Array.from(keyDescriptor.key.slice(0, 16))
+                    .map((b) => b.toString(16).padStart(2, "0"))
+                    .join("");
                 errors.push({
                     kind: "UNSUPPORTED",
                     code: "ark.unknown-field",
-                    message: `Tx ${txid} input ${j} carries unrecognised Ark PSBT field type 0x${fieldType.toString(16)}`,
-                    context: { txid, input_index: j, field_type: fieldType },
+                    message: `Tx ${txid} input ${j} carries unrecognised Ark PSBT field key 0x${keyPreview}`,
+                    context: {
+                        txid,
+                        input_index: j,
+                        key_prefix_hex: keyPreview,
+                    },
                 });
             }
         }
     }
-}
-
-function extractFieldType(keyDescriptor: unknown): number | null {
-    if (!keyDescriptor || typeof keyDescriptor !== "object") return null;
-    const o = keyDescriptor as { type?: unknown };
-    if (typeof o.type === "number") return o.type;
-    return null;
 }
 
 function extractVtxoTaprootTreeBlob(
@@ -180,11 +209,19 @@ function extractVtxoTaprootTreeBlob(
     const inp = tx.getInput(j);
     const unknownMap = (inp as { unknown?: unknown }).unknown;
     if (!Array.isArray(unknownMap)) return null;
-    for (const [keyDescriptor, blob] of unknownMap as Array<
-        [unknown, Uint8Array]
+    for (const pair of unknownMap as Array<
+        [{ type: number; key: Uint8Array }, Uint8Array]
     >) {
-        const t = extractFieldType(keyDescriptor);
-        if (t === 0x00 && blob instanceof Uint8Array) return blob;
+        const keyDescriptor = pair[0];
+        const blob = pair[1];
+        if (
+            keyDescriptor?.type === ARK_PSBT_FIELD_KEY_TYPE &&
+            keyDescriptor.key instanceof Uint8Array &&
+            keyStartsWith(keyDescriptor.key, "taptree") &&
+            blob instanceof Uint8Array
+        ) {
+            return blob;
+        }
     }
     return null;
 }

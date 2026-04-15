@@ -353,7 +353,15 @@ export async function walkChain(
             });
         }
         try {
-            parsed.set(txid, Transaction.fromPSBT(base64.decode(psbtB64)));
+            // allowUnknown: true so Ark-namespaced PSBT unknown fields
+            // (VtxoTaprootTree, Cosigner, ConditionWitness, VtxoTreeExpiry)
+            // survive the parse — the script-verifier consumes them.
+            parsed.set(
+                txid,
+                Transaction.fromPSBT(base64.decode(psbtB64), {
+                    allowUnknown: true,
+                })
+            );
         } catch (e) {
             throw new MalformedChainError({
                 kind: "DATA",
@@ -613,15 +621,31 @@ export async function walkChain(
             const unknownMap = (inp as { unknown?: unknown }).unknown;
             if (!Array.isArray(unknownMap)) continue;
             for (const pair of unknownMap as Array<
-                [unknown, Uint8Array | undefined]
+                [{ type: number; key: Uint8Array }, Uint8Array | undefined]
             >) {
                 const key = pair[0];
                 const blob = pair[1];
-                const t =
-                    key && typeof key === "object" && "type" in key
-                        ? (key as { type?: unknown }).type
-                        : undefined;
-                if (t !== 0x00) continue; // VtxoTaprootTree field type
+                // Ark PSBT fields use type=222; the VtxoTaprootTree
+                // discriminator is the UTF-8 "taptree" prefix on the
+                // key bytes (see src/utils/unknownFields.ts).
+                if (
+                    !key ||
+                    key.type !== 222 ||
+                    !(key.key instanceof Uint8Array)
+                )
+                    continue;
+                const k = key.key;
+                if (
+                    k.length < 7 ||
+                    k[0] !== 0x74 || // 't'
+                    k[1] !== 0x61 || // 'a'
+                    k[2] !== 0x70 || // 'p'
+                    k[3] !== 0x74 || // 't'
+                    k[4] !== 0x72 || // 'r'
+                    k[5] !== 0x65 || // 'e'
+                    k[6] !== 0x65 // 'e'
+                )
+                    continue;
                 if (!(blob instanceof Uint8Array)) {
                     scriptTreeFailed++;
                     scriptTreeDetails.push(
@@ -770,18 +794,35 @@ export async function walkChain(
         ),
     }));
 
-    // Re-assemble path with parsed Transactions attached on off-chain
-    // nodes, so downstream verifiers (signature / script / etc.) can
-    // consume the parsed shape without reparsing the PSBTs.
-    const pathWithTx: DagNode[] = path.map((node) => {
-        const parsedTx = parsed.get(node.txid);
+    // Re-assemble path AND graph.nodes with parsed Transactions attached
+    // on off-chain nodes, so downstream verifiers (signature / script /
+    // extractor) can consume the parsed shape via either API without
+    // re-parsing the PSBTs.
+    const updatedNodes = new Map<Txid, DagNode>();
+    for (const [txid, node] of graph.nodes) {
+        const parsedTx = parsed.get(txid);
         if (parsedTx) {
-            return { ...node, tx: parsedTx };
+            updatedNodes.set(txid, { ...node, tx: parsedTx });
+        } else {
+            updatedNodes.set(txid, node);
         }
-        return node;
-    });
+    }
+    const graphWithTx: DagGraph = {
+        nodes: updatedNodes,
+        parents: graph.parents,
+        children: graph.children,
+        roots: graph.roots,
+    };
+    const pathWithTx: DagNode[] = path.map(
+        (node) => updatedNodes.get(node.txid) ?? node
+    );
 
-    return { checks, dag: graph, path: pathWithTx, commitments };
+    return {
+        checks,
+        dag: graphWithTx,
+        path: pathWithTx,
+        commitments,
+    };
 }
 
 /**

@@ -192,9 +192,16 @@ export async function verifyPreimages(
         }
     }
 
-    // Per-tx preimage candidate extraction + match.
+    // Per-tx preimage candidate extraction + match. Pre-signed Ark txs
+    // do not carry finalScriptWitness until exit time (BIP 174 finalize
+    // happens at broadcast, not pre-sign). When commitments exist but
+    // no witness stack is present on the spending input, the check
+    // reports "pending finalization" rather than flipping — matching
+    // would be structurally impossible at this stage, not a tamper
+    // signal.
     let matches = 0;
     const missing: string[] = [];
+    const pending: string[] = [];
     const mismatched: string[] = [];
     for (const entry of path) {
         const txid = entry.tx.id as Txid;
@@ -219,7 +226,17 @@ export async function verifyPreimages(
         candidatesExtracted += candidates.length;
 
         const commitmentsForTx = commitments.filter((c) => c.txid === txid);
+        const txHasWitness = candidates.length > 0;
         for (const commit of commitmentsForTx) {
+            if (!txHasWitness) {
+                // Pre-sign state: no witness to check against. This is
+                // the expected condition for unbroadcasted Ark txs —
+                // recorded as UNSUPPORTED-pending, not a match failure.
+                pending.push(
+                    `${commit.txid} input ${commit.inputIndex} ${commit.kind} commitment pending finalization (no witness stack yet)`
+                );
+                continue;
+            }
             let matched = false;
             for (const cand of candidates) {
                 const h =
@@ -233,15 +250,14 @@ export async function verifyPreimages(
             }
             if (matched) matches++;
             else {
-                // No matching candidate — either unsatisfied or
-                // mismatched. We classify both as "not yet matched"
-                // since we can't tell them apart without context.
-                missing.push(
-                    `${commit.txid} input ${commit.inputIndex} ${commit.kind} commitment unsatisfied`
+                // Witness present but no match — genuine tamper signal.
+                mismatched.push(
+                    `${commit.txid} input ${commit.inputIndex} ${commit.kind} commitment has witness but no matching preimage`
                 );
             }
         }
     }
+    void missing;
 
     const checks: CheckResult[] = [];
     checks.push({
@@ -259,7 +275,9 @@ export async function verifyPreimages(
             hash160_commitments: hash160Count,
         },
     });
-    const matchesPassed = missing.length === 0 && mismatched.length === 0;
+    // Only mismatched (witness-present + no-match) is a real failure.
+    // Pending (no-witness-yet) is pre-signed state, not tamper.
+    const matchesPassed = mismatched.length === 0;
     checks.push({
         name: "preimage.hashes-match",
         passed: matchesPassed,
@@ -267,12 +285,14 @@ export async function verifyPreimages(
             commitments.length === 0
                 ? "No hash commitments to verify"
                 : matchesPassed
-                  ? `All ${matches} hash commitment(s) matched by a witness preimage`
-                  : `${missing.length} unmatched: ${missing.join("; ")}`,
+                  ? pending.length > 0
+                      ? `${matches} matched; ${pending.length} pending finalization (no witness yet — normal for pre-signed txs)`
+                      : `All ${matches} hash commitment(s) matched by a witness preimage`
+                  : `${mismatched.length} mismatched: ${mismatched.join("; ")}`,
         durationMs: 0,
         evidence: {
             preimages_matched: matches,
-            preimages_missing: missing.length,
+            preimages_pending: pending.length,
             preimages_mismatched: mismatched.length,
             candidates_extracted: candidatesExtracted,
             max_candidates_per_tx: MAX_PREIMAGE_CANDIDATES,

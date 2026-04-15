@@ -19,16 +19,30 @@ import type { DagAdapter } from "./chain-walker";
  * `sighashType` parameter is REQUIRED (no default) — callers must
  * thread the sighash byte parsed out of the 65-byte Schnorr sig
  * (bug B5 from v1 self-review).
+ *
+ * For script-path spends the caller passes `leafScript` + `leafVersion`
+ * so the BIP 341 ext-flag sighash incorporates the tapleaf hash. For
+ * key-path spends those are omitted.
  */
 export function preimageWitnessV1Typed(
     tx: Transaction,
     inputIndex: number,
     prevouts: PerInputPrevouts,
-    sighashType: SighashType
+    sighashType: SighashType,
+    leafScript?: Uint8Array,
+    leafVersion?: number
 ): Uint8Array {
     const scripts = prevouts.map((p) => p.script);
     const amounts = prevouts.map((p) => p.amount);
-    return tx.preimageWitnessV1(inputIndex, scripts, sighashType, amounts);
+    return tx.preimageWitnessV1(
+        inputIndex,
+        scripts,
+        sighashType,
+        amounts,
+        undefined,
+        leafScript,
+        leafVersion
+    );
 }
 
 export interface SignatureVerifierInput {
@@ -248,6 +262,7 @@ export async function verifySignatures(
                     const sighashType = parseSighashFromSchnorrSig(sig);
                     // Find matching tapLeafScript by leafHash.
                     let matchedScript: Uint8Array | undefined;
+                    let matchedLeafVersion: number | undefined;
                     for (const leaf of tapLeafScriptField) {
                         const scriptBytes = leaf[1];
                         // leafHash expected = tapLeafHash(leafVersion, script)
@@ -259,10 +274,11 @@ export async function verifySignatures(
                         const computed = tapLeafHash(actualScript, lv);
                         if (bytesEqual(computed, meta.leafHash)) {
                             matchedScript = actualScript;
+                            matchedLeafVersion = lv;
                             break;
                         }
                     }
-                    if (!matchedScript) {
+                    if (!matchedScript || matchedLeafVersion === undefined) {
                         throw new MalformedChainError({
                             kind: "DATA",
                             code: "sig.leafhash-mismatch",
@@ -271,11 +287,17 @@ export async function verifySignatures(
                         });
                     }
                     const sigBytes = sig.subarray(0, 64);
+                    // Script-path sighash must include the tapleaf hash —
+                    // pass leafScript + leafVersion through to
+                    // preimageWitnessV1 so BIP 341's ext-flag sighash
+                    // incorporates it.
                     const msg = preimageWitnessV1Typed(
                         entry.tx,
                         j,
                         entry.perInputPrevouts,
-                        sighashType
+                        sighashType,
+                        matchedScript,
+                        matchedLeafVersion
                     );
                     sighashesComputed++;
                     if (schnorr.verify(sigBytes, msg, meta.pubKey)) {

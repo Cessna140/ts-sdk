@@ -1,11 +1,15 @@
-import { base64, hex } from "@scure/base";
+import { base64 } from "@scure/base";
 import { Transaction } from "@scure/btc-signer/transaction.js";
 import type { IndexerProvider, ChainTx } from "../providers/indexer";
 import { ChainTxType } from "../providers/indexer";
 import type { Outpoint } from "../wallet";
 import { MalformedChainError, ProviderUnavailableError } from "./errors";
-import type { CheckResult, CommitmentInfo, Txid } from "./types";
-import { decodeBip68SequenceBlocks, txidFromString } from "./types";
+import type { CheckResult, Txid, UnresolvedCommitmentInfo } from "./types";
+import {
+    decodeBip68SequenceBlocks,
+    txidFromDisplayBytes,
+    txidFromString,
+} from "./types";
 
 /**
  * Maximum fee leak across the DAG before `chain.value-conservation` fails.
@@ -38,7 +42,13 @@ export interface DagWalkerOutput {
     readonly checks: readonly CheckResult[];
     readonly dag: DagGraph;
     readonly path: readonly DagNode[];
-    readonly commitments: readonly CommitmentInfo[];
+    /**
+     * Unresolved commitments — one entry per DAG root. P5 resolves each
+     * to a {@link ResolvedCommitmentInfo} via on-chain queries + the
+     * commitment script's CLTV parse. See B9 invariant: the resolver
+     * is the only path from on-chain data to a {@link BlockHeight}.
+     */
+    readonly commitments: readonly UnresolvedCommitmentInfo[];
 }
 
 export interface ChainWalkerInput {
@@ -365,6 +375,8 @@ export async function walkChain(
     let totalFeeLeakSats = 0n;
     let valueInversions = 0;
     const valueDetails: string[] = [];
+    const valueConservedTxs: Txid[] = [];
+    const valueSkippedTxs: Txid[] = [];
     let scriptsChecked = 0;
     let scriptsFailed = 0;
     const scriptDetails: string[] = [];
@@ -373,6 +385,14 @@ export async function walkChain(
         (id) => graph.nodes.get(id)?.type !== ChainTxType.COMMITMENT
     );
     const seenScript = new Set<Txid>();
+
+    // Count input/parent mismatches so they emit as a CheckResult row
+    // rather than a throw — a malicious indexer could desynchronise
+    // inputsLength vs declaredParents.length to force early exit and
+    // hide evidence from other checks. We keep the trace intact and
+    // iterate min(inputsLength, declaredParents.length) edges per tx.
+    let inputCountMismatches = 0;
+    const inputCountDetails: string[] = [];
 
     for (const childTxid of offchainTxids) {
         throwIfAborted(signal);
@@ -386,23 +406,23 @@ export async function walkChain(
             });
         }
         const declaredParents = graph.parents.get(childTxid) ?? [];
-        if (childTx.inputsLength < declaredParents.length) {
-            throw new MalformedChainError({
-                kind: "DATA",
-                code: "chain.input-count-mismatch",
-                message: `Tx ${childTxid} declares ${declaredParents.length} parents but PSBT has ${childTx.inputsLength} input(s)`,
-                context: {
-                    txid: childTxid,
-                    declared: declaredParents.length,
-                    parsed: childTx.inputsLength,
-                },
-            });
+        if (childTx.inputsLength !== declaredParents.length) {
+            inputCountMismatches++;
+            inputCountDetails.push(
+                `${childTxid}: declared ${declaredParents.length} parent(s), PSBT has ${childTx.inputsLength} input(s)`
+            );
+            // Continue iterating the edges we CAN pair up so other
+            // checks still report evidence for this tx.
         }
+        const edgesToWalk = Math.min(
+            declaredParents.length,
+            childTx.inputsLength
+        );
 
         let spentInputSum = 0n;
         let childHasUnresolvedAmount = false;
 
-        for (let i = 0; i < declaredParents.length; i++) {
+        for (let i = 0; i < edgesToWalk; i++) {
             const parentTxid = declaredParents[i];
             const parentNode = graph.nodes.get(parentTxid);
             const parentTx = parsed.get(parentTxid);
@@ -415,7 +435,7 @@ export async function walkChain(
                     context: { txid: childTxid, input_index: i },
                 });
             }
-            const claimedParentTxid = txidFromBytesToDisplay(input.txid);
+            const claimedParentTxid = txidFromDisplayBytes(input.txid);
             const claimedVout = input.index;
 
             // parent-link (per edge)
@@ -466,7 +486,14 @@ export async function walkChain(
                 );
             } else {
                 totalFeeLeakSats += spentInputSum - outSum;
+                valueConservedTxs.push(childTxid);
             }
+        } else {
+            // Tx has a COMMITMENT-typed parent whose batchAmount hasn't
+            // been resolved yet — the check is NOT exercised for this
+            // tx. P5 wires the CommitmentResolver and re-runs value
+            // conservation across the commitment boundary.
+            valueSkippedTxs.push(childTxid);
         }
 
         if (!seenScript.has(childTxid)) {
@@ -485,6 +512,19 @@ export async function walkChain(
         }
     }
 
+    checks.push({
+        name: "chain.input-count-matches",
+        passed: inputCountMismatches === 0,
+        details:
+            inputCountMismatches === 0
+                ? "Every tx's PSBT input count matches its declared spends[] length"
+                : inputCountDetails.join("; "),
+        durationMs: 0,
+        evidence: {
+            mismatch_count: inputCountMismatches,
+            mismatches: inputCountDetails,
+        },
+    });
     checks.push({
         name: "chain.parent-link",
         passed: linksFailed === 0,
@@ -512,20 +552,32 @@ export async function walkChain(
             indices_failed: indicesFailed,
         },
     });
+    const conservationOk =
+        valueInversions === 0 && totalFeeLeakSats <= feeTolerance;
+    const skippedLine =
+        valueSkippedTxs.length > 0
+            ? ` (${valueSkippedTxs.length} tx(s) skipped pending P5 commitment-amount resolution)`
+            : "";
     checks.push({
         name: "chain.value-conservation",
-        passed: valueInversions === 0 && totalFeeLeakSats <= feeTolerance,
-        details:
-            valueInversions === 0 && totalFeeLeakSats <= feeTolerance
-                ? `Total fee leak ${totalFeeLeakSats} sats within tolerance ${feeTolerance}`
-                : valueInversions > 0
-                  ? `${valueInversions} value inflation(s): ${valueDetails.join("; ")}`
-                  : `Fee leak ${totalFeeLeakSats} > tolerance ${feeTolerance}`,
+        passed: conservationOk,
+        details: conservationOk
+            ? `Total fee leak ${totalFeeLeakSats} sats within tolerance ${feeTolerance}${skippedLine}`
+            : valueInversions > 0
+              ? `${valueInversions} value inflation(s): ${valueDetails.join("; ")}`
+              : `Fee leak ${totalFeeLeakSats} > tolerance ${feeTolerance}`,
         durationMs: 0,
         evidence: {
             total_fee_leak_sats: totalFeeLeakSats.toString(),
             fee_tolerance_sats: feeTolerance.toString(),
             value_inversions: valueInversions,
+            txs_conserved: valueConservedTxs.length,
+            txs_skipped: valueSkippedTxs.length,
+            // Reviewers can see at a glance which txs bypassed the check
+            // because a commitment-amount wasn't available yet. Empty on
+            // single-root fully-resolvable DAGs; non-empty on Arkoor /
+            // multi-root DAGs until P5 wires the resolver.
+            skipped_tx_ids: valueSkippedTxs,
         },
     });
     checks.push({
@@ -607,46 +659,32 @@ export async function walkChain(
         },
     });
 
-    // Populate commitments[] shape. batchScript/batchAmount/batchExpiryHeight
-    // are resolved from on-chain data in P5 — here we only record the txid
-    // and the vout each child claims. P5 fills in the rest via the
-    // CommitmentResolver interface (returns Result<CommitmentInfo, error>,
-    // B7 invariant).
-    const commitmentBases = graph.roots.map((txid) => {
-        let vout: number | undefined;
-        for (const [childTxid, parentList] of graph.parents) {
-            for (let i = 0; i < parentList.length; i++) {
-                if (parentList[i] !== txid) continue;
-                const childTx = parsed.get(childTxid);
-                if (!childTx) continue;
-                const inp = childTx.getInput(i);
-                if (inp?.index !== undefined) {
-                    vout = inp.index;
-                    break;
-                }
-            }
-            if (vout !== undefined) break;
+    // Populate commitments[] — one UnresolvedCommitmentInfo per DAG root.
+    // For each commitment we record EVERY vout that any child claims to
+    // spend (bug #8 from P0-P2 review: v1 silently picked only the first
+    // child's claimed vout, losing the 2nd edge in Arkoor multi-input
+    // shapes). P5 resolves each (txid, vout) pair to a
+    // ResolvedCommitmentInfo via the on-chain outputs + CLTV parser.
+    const voutsByRoot = new Map<Txid, Set<number>>();
+    for (const root of graph.roots) voutsByRoot.set(root, new Set());
+    for (const [childTxid, parentList] of graph.parents) {
+        for (let i = 0; i < parentList.length; i++) {
+            const parentTxid = parentList[i];
+            const rootVouts = voutsByRoot.get(parentTxid);
+            if (!rootVouts) continue; // parent is not a root
+            const childTx = parsed.get(childTxid);
+            if (!childTx) continue;
+            const inp = childTx.getInput(i);
+            if (inp?.index === undefined) continue;
+            rootVouts.add(inp.index);
         }
-        return { txid, vout };
-    });
-    // Commitments are only fully materialised in P5 (batchScript/amount/
-    // expiryHeight come from on-chain + CLTV parser). Pre-P5 we expose the
-    // shape with vout resolved; callers will route through P5 for the rest.
-    const commitments = commitmentBases
-        .filter((c): c is { txid: Txid; vout: number } => c.vout !== undefined)
-        .map(
-            (c) =>
-                ({
-                    txid: c.txid,
-                    vout: c.vout,
-                    // P5 fills these in; the walker cannot. Placeholders
-                    // are explicit so consumers see where the gap is.
-                    batchScript: new Uint8Array(0),
-                    batchAmount: 0n,
-                    batchExpiryHeight:
-                        0 as unknown as CommitmentInfo["batchExpiryHeight"],
-                }) as CommitmentInfo
-        );
+    }
+    const commitments: UnresolvedCommitmentInfo[] = graph.roots.map((txid) => ({
+        txid,
+        claimedVouts: Array.from(voutsByRoot.get(txid) ?? []).sort(
+            (a, b) => a - b
+        ),
+    }));
 
     return { checks, dag: graph, path, commitments };
 }
@@ -681,19 +719,6 @@ function countEdges(g: DagGraph): number {
     let n = 0;
     for (const p of g.parents.values()) n += p.length;
     return n;
-}
-
-function txidFromBytesToDisplay(bytes: Uint8Array): Txid {
-    // @scure/btc-signer stores PSBT input.txid bytes already in display
-    // byte-order (the same order that `Transaction.id` returns). A raw
-    // hex.encode is the correct conversion; a reverse here would double-
-    // reverse and break the B2 parent-link invariant.
-    if (bytes.length !== 32) {
-        throw new Error(
-            `txidFromBytesToDisplay: expected 32 bytes, got ${bytes.length}`
-        );
-    }
-    return hex.encode(bytes) as Txid;
 }
 
 function errMessage(e: unknown): string {

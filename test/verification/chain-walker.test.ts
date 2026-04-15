@@ -31,7 +31,7 @@ describe("chain walker / buildDag", () => {
                 vtxo: fx.leaf,
                 indexerProvider: indexer,
             });
-            expect(out.checks).toHaveLength(7);
+            expect(out.checks).toHaveLength(8);
             for (const c of out.checks) {
                 expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
             }
@@ -166,6 +166,45 @@ describe("chain walker / buildDag", () => {
             ).rejects.toMatchObject({
                 payload: { code: "indexer.getVtxoChain-failed" },
             });
+        });
+    });
+
+    describe("commitments[] multi-vout", () => {
+        it("collects every claimed vout per commitment root (bug #8 fix)", async () => {
+            const fx = buildMockMultiRootChain();
+            const indexer = makeMockIndexerProvider({
+                vtxoChain: fx.vtxoChain,
+                virtualTxs: fx.virtualTxs,
+            });
+            const out = await walkChain({
+                vtxo: fx.leaf,
+                indexerProvider: indexer,
+            });
+            expect(out.commitments).toHaveLength(2);
+            for (const c of out.commitments) {
+                expect(c.claimedVouts.length).toBeGreaterThanOrEqual(1);
+            }
+        });
+    });
+
+    describe("value-conservation evidence surfaces skipped txs (bug #5 fix)", () => {
+        it("multi-root DAG reports skipped_tx_ids for commitment-parented child", async () => {
+            const fx = buildMockMultiRootChain();
+            const indexer = makeMockIndexerProvider({
+                vtxoChain: fx.vtxoChain,
+                virtualTxs: fx.virtualTxs,
+            });
+            const out = await walkChain({
+                vtxo: fx.leaf,
+                indexerProvider: indexer,
+            });
+            const vc = out.checks.find(
+                (c) => c.name === "chain.value-conservation"
+            );
+            // Leaf has two COMMITMENT parents; both amounts unresolved until P5.
+            expect(vc?.evidence?.txs_skipped).toBe(1);
+            expect(Array.isArray(vc?.evidence?.skipped_tx_ids)).toBe(true);
+            expect((vc?.evidence?.skipped_tx_ids as string[]).length).toBe(1);
         });
     });
 

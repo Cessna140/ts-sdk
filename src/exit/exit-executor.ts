@@ -23,22 +23,17 @@ export interface ExecuteUnilateralExitInput {
 /**
  * Executes a unilateral exit using only locally-stored bundle data + an
  * on-chain provider. Never contacts the ASP's IndexerService. Never
- * throws — returns a typed {@link ExitExecutionResult} with per-step
- * trace + structured errors (mirrors verifier partial-failure discipline).
+ * throws in production — returns a typed {@link ExitExecutionResult}
+ * with per-step trace + structured errors (mirrors verifier
+ * partial-failure discipline).
  *
- * Stub — implementation lands in P6.
+ * The P0 scaffold throws — consistent with every other stub in the
+ * verification + exit modules — so the "not yet implemented" state is
+ * unmistakable. Once P6 lands the real executor, the function returns
+ * the typed result without throwing.
  */
 export async function executeUnilateralExit(
     _input: ExecuteUnilateralExitInput
 ): Promise<ExitExecutionResult> {
-    return {
-        broadcasted: [],
-        steps: [],
-        errors: [
-            {
-                code: "executor.not-implemented",
-                message: "executeUnilateralExit is a P0 scaffold",
-            },
-        ],
-    };
+    throw new Error("executeUnilateralExit: not implemented until P6");
 }

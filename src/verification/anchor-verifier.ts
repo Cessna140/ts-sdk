@@ -1,15 +1,21 @@
-import type { CheckResult, CommitmentInfo } from "./types";
+import type { CheckResult, ResolvedCommitmentInfo } from "./types";
 
 /**
  * Anchor verifier input. `commitments` is an array from day one — bug
  * B4 from v1 self-review where the verifier had a singular
  * `batchOutpoint` field and silently skipped value-conservation at the
  * commitment boundary. Every commitment carries its own `batchAmount`,
- * `batchScript`, and `batchExpiryHeight` (see {@link CommitmentInfo}),
- * so the verifier reads them unconditionally.
+ * `batchScript`, and `batchExpiryHeight` (see
+ * {@link ResolvedCommitmentInfo}), so the verifier reads them
+ * unconditionally.
+ *
+ * The input type is `ResolvedCommitmentInfo` (not the walker's
+ * `UnresolvedCommitmentInfo`) — P5 routes the walker's output through
+ * a `CommitmentResolver` that fills in batchScript/batchAmount/
+ * batchExpiryHeight before this verifier runs.
  */
 export interface AnchorVerifierInput {
-    readonly commitments: readonly CommitmentInfo[];
+    readonly commitments: readonly ResolvedCommitmentInfo[];
     readonly onchainProvider: unknown;
     readonly minConfirmations?: number;
     readonly signal?: AbortSignal;

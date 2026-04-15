@@ -1,7 +1,7 @@
 import type {
     BlockHeight,
-    CommitmentInfo,
     PerPathSchedule,
+    ResolvedCommitmentInfo,
     Txid,
 } from "../verification/types";
 
@@ -31,7 +31,7 @@ export interface ClaimTemplate {
  */
 export interface UnilateralExitBundle {
     readonly vtxoId: string;
-    readonly commitments: readonly CommitmentInfo[];
+    readonly commitments: readonly ResolvedCommitmentInfo[];
     readonly transactionPath: readonly ExitPathEntry[];
     readonly claimTemplate: ClaimTemplate;
     readonly csvDelayBlocks: number;

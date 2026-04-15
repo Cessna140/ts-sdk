@@ -136,4 +136,20 @@ describe("P2: parseCLTVFromCommitmentScript", () => {
     it("CLTV_HEIGHT_THRESHOLD is 500_000_000 per BIP 65", () => {
         expect(CLTV_HEIGHT_THRESHOLD).toBe(500_000_000);
     });
+
+    it("rejects negative CScriptNum via OP_1NEGATE (BIP 65 forbids negatives)", () => {
+        // OP_1NEGATE (0x4f), OP_CLTV (0xb1)
+        const script = new Uint8Array([0x4f, 0xb1]);
+        expect(() => parseCLTVFromCommitmentScript(script)).toThrow(
+            /negative value/
+        );
+    });
+
+    it("rejects negative CScriptNum via direct-push with sign bit", () => {
+        // [len=1, 0x81] — sign bit set, value = -1
+        const script = new Uint8Array([0x01, 0x81, 0xb1]);
+        expect(() => parseCLTVFromCommitmentScript(script)).toThrow(
+            /negative value/
+        );
+    });
 });

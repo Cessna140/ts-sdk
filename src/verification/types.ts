@@ -1,22 +1,61 @@
 import type { Transaction } from "@scure/btc-signer";
 
 /**
- * Branded display-order txid string. Sole constructor is {@link toDisplayTxid}.
- * Prevents accidental comparison between internal (little-endian) and display
- * (reversed) byte-orders — bug B2 from v1 self-review.
+ * Branded display-order txid string (B2 invariant). A txid in Bitcoin has
+ * two byte orderings:
+ *
+ *   - **internal** — the bytes as serialised in the wire format (tx
+ *     previous-output reference, CTransaction.id internal field).
+ *   - **display** — the reverse of internal. What block explorers,
+ *     `bitcoin-cli` output, and `Transaction.id` (getter on @scure's
+ *     `Transaction`) produce.
+ *
+ * Everything in this module uses display order. The three constructors
+ * below differ only in what their input's byte order is — each docstring
+ * anchors the @scure API that produces it, so a future author cannot
+ * silently double-reverse.
+ *
+ * Raw `string` cannot be assigned to a `Txid` — consumers must pick the
+ * constructor that matches their input.
  */
 export type Txid = string & { readonly __brand: "display-order-txid" };
 
 /**
- * Converts a 32-byte txid (in @scure/btc-signer internal little-endian order)
- * to a display-order hex string. All Txid values flowing through the
- * verification module must be constructed via this function — raw hex strings
- * or byte arrays cannot be compared as Txid values without this conversion.
+ * Construct a Txid from 32 bytes already in display order.
+ *
+ * Use this with:
+ *   - PSBT `input.txid` (@scure/btc-signer stores this field in display
+ *     order — verified by round-tripping `tx.id` through `hex.encode`).
+ *
+ * Does NOT reverse. If you reverse before calling this, you'll get the
+ * internal-order txid back, which won't match anything else in the module.
  */
-export function toDisplayTxid(bytes: Uint8Array): Txid {
+export function txidFromDisplayBytes(bytes: Uint8Array): Txid {
     if (bytes.length !== 32) {
         throw new Error(
-            `toDisplayTxid: expected 32 bytes, got ${bytes.length}`
+            `txidFromDisplayBytes: expected 32 bytes, got ${bytes.length}`
+        );
+    }
+    let out = "";
+    for (const b of bytes) out += b.toString(16).padStart(2, "0");
+    return out as Txid;
+}
+
+/**
+ * Construct a Txid from 32 bytes in internal (wire-format) order.
+ *
+ * Use this with:
+ *   - Raw tx prev-output references as they appear in serialised
+ *     Bitcoin transactions (internal field order).
+ *
+ * REVERSES the bytes before encoding. Do NOT use with @scure's
+ * `input.txid` (which is already display order — use
+ * {@link txidFromDisplayBytes} for that).
+ */
+export function txidFromInternalBytes(bytes: Uint8Array): Txid {
+    if (bytes.length !== 32) {
+        throw new Error(
+            `txidFromInternalBytes: expected 32 bytes, got ${bytes.length}`
         );
     }
     const reversed = new Uint8Array(32);
@@ -28,9 +67,8 @@ export function toDisplayTxid(bytes: Uint8Array): Txid {
 
 /**
  * Construct a Txid from a pre-display-order hex string (e.g. an indexer
- * response's `ChainTx.txid`). Validates the shape is 64 lowercase hex
- * characters. This is the second and only other constructor — consumers
- * cannot assign a raw `string` to a `Txid` variable.
+ * response's `ChainTx.txid`, `Transaction.id`). Validates the shape is
+ * 64 lowercase hex characters.
  */
 export function txidFromString(hex: string): Txid {
     if (!/^[0-9a-f]{64}$/.test(hex)) {
@@ -78,7 +116,7 @@ function readCScriptNum(
     if (n & signBit) {
         n = -(n & (signBit - 1n));
     }
-    if (n < 0n || n > BigInt(Number.MAX_SAFE_INTEGER)) {
+    if (n > BigInt(Number.MAX_SAFE_INTEGER)) {
         throw new Error(`CScriptNum out of range: ${n}`);
     }
     return Number(n);
@@ -110,6 +148,11 @@ export function parseCLTVFromCommitmentScript(script: Uint8Array): BlockHeight {
             if (lastPushValue === null) {
                 throw new Error(
                     "parseCLTVFromCommitmentScript: OP_CLTV with no preceding push"
+                );
+            }
+            if (lastPushValue < 0) {
+                throw new Error(
+                    `parseCLTVFromCommitmentScript: negative value ${lastPushValue} is not a valid block height (BIP 65 rejects negatives)`
                 );
             }
             if (lastPushValue >= CLTV_HEIGHT_THRESHOLD) {
@@ -194,19 +237,56 @@ export function decodeBip68SequenceBlocks(nSequence: number): number | null {
 }
 
 /**
- * Sighash-type wrapper. A non-default constructor is required so that
- * {@link preimageWitnessV1Typed} callers must thread the parsed sighash byte
- * from the 65-byte Schnorr signature — hardcoded SigHash.DEFAULT cannot
- * silently creep in (bug B5 from v1 self-review).
+ * Sighash-type wrapper (B5 invariant). The ONLY constructor is
+ * {@link parseSighashFromSchnorrSig} — `SighashType` cannot be built
+ * from a bare number. This forces signature-verifier call sites to
+ * thread the sighash byte parsed out of the 65-byte Schnorr signature;
+ * hardcoded `SigHash.DEFAULT` cannot silently creep into
+ * `preimageWitnessV1` invocations (bug B5 from v1 self-review).
+ *
+ * For signatures where no sighash byte is appended (the 64-byte form
+ * per BIP 341 §Default), use {@link sighashTypeDefault} — a labelled
+ * constant whose callers visibly opt in.
  */
 export type SighashType = number & { readonly __brand: "sighash-type" };
 
-export function toSighashType(byte: number): SighashType {
-    if (!Number.isInteger(byte) || byte < 0 || byte > 0xff) {
-        throw new Error(`toSighashType: invalid byte ${byte}`);
+/**
+ * Parse the sighash-type byte from a BIP 340 Schnorr signature.
+ *
+ * BIP 341 §Default: a 64-byte sig means SIGHASH_DEFAULT (0x00). A 65-byte
+ * sig carries the sighash byte at `sig[64]`; 0x00 is forbidden (must use
+ * the 64-byte form), and common valid values are 0x01 (ALL), 0x02 (NONE),
+ * 0x03 (SINGLE), plus the ACP-OR'd variants 0x81/0x82/0x83.
+ *
+ * This is the sole real-data constructor for {@link SighashType}. The
+ * only other entry point is {@link sighashTypeDefault}, which requires
+ * the caller to name the default explicitly.
+ */
+export function parseSighashFromSchnorrSig(sig: Uint8Array): SighashType {
+    if (sig.length === 64) {
+        return 0x00 as SighashType;
     }
-    return byte as SighashType;
+    if (sig.length === 65) {
+        const b = sig[64];
+        if (b === 0x00) {
+            throw new Error(
+                "parseSighashFromSchnorrSig: 65-byte sig with sighash=0x00 is invalid (BIP 341: use the 64-byte form)"
+            );
+        }
+        return b as SighashType;
+    }
+    throw new Error(
+        `parseSighashFromSchnorrSig: expected 64- or 65-byte sig, got ${sig.length} bytes`
+    );
 }
+
+/**
+ * The SIGHASH_DEFAULT sentinel (0x00). Exists only so opt-in callers
+ * that genuinely need the default (e.g. testing a key-path spend that
+ * uses 64-byte sigs) can name it — a bare `0` will not type-check as
+ * {@link SighashType}.
+ */
+export const sighashTypeDefault: SighashType = 0 as SighashType;
 
 /**
  * A prevout (scriptPubKey + value) that a particular input is spending.
@@ -275,19 +355,53 @@ export function err<E>(error: E): Result<never, E> {
 }
 
 /**
- * Commitment-transaction metadata resolved by the DAG walker for each
- * commitment root. Every field is required — no optional batchAmount,
- * no default vout — which kills bug B4 (value-conservation silently
- * skipped at commitment boundary) and bug B7 (vout silently defaulting
- * to 0) from v1 self-review.
+ * Walker-stage commitment metadata. At DAG-construction time the walker
+ * knows the txid and can observe the vout each child claims; the
+ * {@link batchScript}, {@link batchAmount}, and {@link batchExpiryHeight}
+ * are only available after P5 (on-chain resolution + CLTV parse).
+ *
+ * A walker {@link UnresolvedCommitmentInfo} cannot be passed to a P5
+ * anchor-verifier slot expecting {@link ResolvedCommitmentInfo} —
+ * TypeScript rejects the assignment. This is how the B9 invariant is
+ * preserved across stages: the "placeholder BlockHeight" cast that v1
+ * needed has no home in v2's types.
  */
-export interface CommitmentInfo {
+export interface UnresolvedCommitmentInfo {
+    readonly txid: Txid;
+    /**
+     * The vouts each child claims to spend from this commitment. Array
+     * form (not a single number) so multi-input Arkoor DAGs, where two
+     * children spend different vouts of the same commitment, don't lose
+     * one of the edges — bug #8 from the P0-P2 review.
+     */
+    readonly claimedVouts: readonly number[];
+}
+
+/**
+ * Fully-resolved commitment metadata. Every field is required and every
+ * constructor path enforces the B-invariants: {@link batchAmount} never
+ * optional (B4), {@link vout} never defaulting (B7), {@link batchExpiryHeight}
+ * only via {@link parseCLTVFromCommitmentScript} (B9).
+ *
+ * The anchor verifier and exit-bundle builder consume this shape; the
+ * chain walker emits {@link UnresolvedCommitmentInfo}; P5 resolves the
+ * gap.
+ */
+export interface ResolvedCommitmentInfo {
     readonly txid: Txid;
     readonly vout: number;
     readonly batchScript: Uint8Array;
     readonly batchAmount: bigint;
     readonly batchExpiryHeight: BlockHeight;
 }
+
+/**
+ * @deprecated Legacy alias while the module transitions from the
+ * walker's unresolved shape to the post-P5 resolved shape. New code
+ * should reference {@link ResolvedCommitmentInfo} or
+ * {@link UnresolvedCommitmentInfo} directly.
+ */
+export type CommitmentInfo = ResolvedCommitmentInfo;
 
 export type CommitmentResolveError =
     | "commitment-vout-unresolved"

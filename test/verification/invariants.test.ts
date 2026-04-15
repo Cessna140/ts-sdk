@@ -13,35 +13,51 @@
 
 import { describe, expect, it } from "vitest";
 import {
-    toDisplayTxid,
-    toSighashType,
+    txidFromDisplayBytes,
+    txidFromInternalBytes,
+    parseSighashFromSchnorrSig,
+    sighashTypeDefault,
     makeSignaturePathEntry,
     ok,
     err,
     type Txid,
     type BlockHeight,
-    type CommitmentInfo,
+    type ResolvedCommitmentInfo,
     type Prevout,
     type Result,
     type SighashType,
 } from "../../src/verification/types";
 import { anchorVoutInRange } from "../../src/verification/anchor-verifier";
 import { MAX_PREIMAGE_CANDIDATES } from "../../src/verification/preimage-verifier";
+import { makeDagAdapter } from "../../src/verification/chain-walker";
 
 describe("P0 invariants (bug prevention)", () => {
-    describe("B2 — Txid is display-order branded", () => {
-        it("raw hex strings cannot be used as Txid without toDisplayTxid", () => {
+    describe("B2 — Txid is display-order branded with named constructors", () => {
+        it("raw strings cannot be used as Txid", () => {
             const bytes = new Uint8Array(32).fill(0xab);
-            const txid: Txid = toDisplayTxid(bytes);
+            const txid: Txid = txidFromDisplayBytes(bytes);
             // @ts-expect-error — raw string is not assignable to Txid
             const bogus: Txid = "abababab";
             expect(txid).toMatch(/^[0-9a-f]{64}$/);
             expect(typeof bogus).toBe("string");
         });
 
-        it("toDisplayTxid rejects wrong-length byte arrays", () => {
-            expect(() => toDisplayTxid(new Uint8Array(31))).toThrow();
-            expect(() => toDisplayTxid(new Uint8Array(33))).toThrow();
+        it("txidFromInternalBytes reverses; txidFromDisplayBytes does not", () => {
+            // Byte 0 = 0x01, byte 31 = 0x02, middle zeros.
+            const bytes = new Uint8Array(32);
+            bytes[0] = 0x01;
+            bytes[31] = 0x02;
+            expect(txidFromDisplayBytes(bytes)).toBe(
+                "01" + "00".repeat(30) + "02"
+            );
+            expect(txidFromInternalBytes(bytes)).toBe(
+                "02" + "00".repeat(30) + "01"
+            );
+        });
+
+        it("both constructors reject wrong-length byte arrays", () => {
+            expect(() => txidFromDisplayBytes(new Uint8Array(31))).toThrow();
+            expect(() => txidFromInternalBytes(new Uint8Array(33))).toThrow();
         });
     });
 
@@ -62,11 +78,35 @@ describe("P0 invariants (bug prevention)", () => {
         });
     });
 
-    describe("B5 — SighashType is required (no default param)", () => {
-        it("toSighashType validates range", () => {
-            expect(toSighashType(0).valueOf()).toBe(0);
-            expect(() => toSighashType(-1)).toThrow();
-            expect(() => toSighashType(256)).toThrow();
+    describe("B5 — SighashType only constructible from a real Schnorr sig", () => {
+        it("parseSighashFromSchnorrSig: 64-byte sig → 0x00", () => {
+            expect(parseSighashFromSchnorrSig(new Uint8Array(64))).toBe(0);
+        });
+
+        it("parseSighashFromSchnorrSig: 65-byte sig carries the sighash byte", () => {
+            const sig = new Uint8Array(65);
+            sig[64] = 0x81; // SIGHASH_ALL | ACP
+            expect(parseSighashFromSchnorrSig(sig)).toBe(0x81);
+        });
+
+        it("parseSighashFromSchnorrSig: 65-byte sig with sighash=0x00 is rejected", () => {
+            const sig = new Uint8Array(65); // byte 64 = 0x00
+            expect(() => parseSighashFromSchnorrSig(sig)).toThrow(
+                /64-byte form/
+            );
+        });
+
+        it("parseSighashFromSchnorrSig rejects wrong-length", () => {
+            expect(() =>
+                parseSighashFromSchnorrSig(new Uint8Array(63))
+            ).toThrow();
+            expect(() =>
+                parseSighashFromSchnorrSig(new Uint8Array(66))
+            ).toThrow();
+        });
+
+        it("sighashTypeDefault is an opt-in labelled constant", () => {
+            expect(sighashTypeDefault).toBe(0);
         });
 
         it("raw numbers cannot be used as SighashType", () => {
@@ -111,11 +151,11 @@ describe("P0 invariants (bug prevention)", () => {
         });
     });
 
-    describe("B4 + B7 — CommitmentInfo requires batchAmount + vout", () => {
-        it("CommitmentInfo cannot be constructed without batchAmount", () => {
+    describe("B4 + B7 — ResolvedCommitmentInfo requires every field", () => {
+        it("ResolvedCommitmentInfo cannot be constructed without batchAmount", () => {
             // @ts-expect-error — batchAmount is a required field
-            const bogus: CommitmentInfo = {
-                txid: toDisplayTxid(new Uint8Array(32)),
+            const bogus: ResolvedCommitmentInfo = {
+                txid: txidFromDisplayBytes(new Uint8Array(32)),
                 vout: 0,
                 batchScript: new Uint8Array(34),
                 batchExpiryHeight: 100 as BlockHeight,
@@ -123,10 +163,10 @@ describe("P0 invariants (bug prevention)", () => {
             expect(bogus).toBeDefined();
         });
 
-        it("CommitmentInfo cannot be constructed without vout", () => {
+        it("ResolvedCommitmentInfo cannot be constructed without vout", () => {
             // @ts-expect-error — vout is a required field; no default 0
-            const bogus: CommitmentInfo = {
-                txid: toDisplayTxid(new Uint8Array(32)),
+            const bogus: ResolvedCommitmentInfo = {
+                txid: txidFromDisplayBytes(new Uint8Array(32)),
                 batchScript: new Uint8Array(34),
                 batchAmount: 1000n,
                 batchExpiryHeight: 100 as BlockHeight,
@@ -168,10 +208,17 @@ describe("P0 invariants (bug prevention)", () => {
     });
 
     describe("B3 + B10 — DAG iterator and per-path schedule APIs exist", () => {
-        it("DagAdapter exposes commitmentParentedInputs", async () => {
-            const mod = await import("../../src/verification/chain-walker");
-            // Type-only check: the interface name is exported.
-            expect(mod).toBeDefined();
+        it("DagAdapter.commitmentParentedInputs is a real iterator factory", () => {
+            expect(typeof makeDagAdapter).toBe("function");
+            const emptyGraph = {
+                nodes: new Map(),
+                parents: new Map(),
+                children: new Map(),
+                roots: [],
+            };
+            const adapter = makeDagAdapter(emptyGraph);
+            expect(typeof adapter.commitmentParentedInputs).toBe("function");
+            expect(Array.from(adapter.commitmentParentedInputs())).toEqual([]);
         });
 
         it("scheduleFromDag is the only constructor path", async () => {

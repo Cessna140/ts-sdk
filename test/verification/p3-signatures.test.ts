@@ -88,8 +88,8 @@ describe("P3: verifyVtxo end-to-end (B1 invariant)", () => {
             indexerProvider: indexer,
             onchainProvider: onchain,
         });
-        // Expect 8 chain + 4 sig = 12 check rows.
-        expect(result.checks.length).toBe(12);
+        // Expect 9 chain + 4 sig = 13 check rows.
+        expect(result.checks.length).toBe(13);
         // Every row passed.
         for (const c of result.checks) {
             expect(c.passed, `${c.name}: ${c.details}`).toBe(true);

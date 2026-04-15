@@ -32,6 +32,9 @@ import {
     VerificationThrownError,
 } from "./errors";
 import { verifySignatures } from "./signature-verifier";
+import { verifyScripts } from "./script-verifier";
+import { verifyTimelocks } from "./timelock-verifier";
+import { verifyPreimages } from "./preimage-verifier";
 import type {
     CheckResult,
     Prevout,
@@ -61,6 +64,23 @@ export {
     preimageWitnessV1Typed,
     type SignatureVerifierInput,
 } from "./signature-verifier";
+export {
+    verifyScripts,
+    type ScriptVerifierInput,
+    type ScriptVerifierOutput,
+} from "./script-verifier";
+export {
+    verifyTimelocks,
+    type TimelockVerifierInput,
+    DEFAULT_MIN_CSV_BLOCKS,
+    DEFAULT_MAX_CSV_BLOCKS,
+} from "./timelock-verifier";
+export {
+    verifyPreimages,
+    decodeWitnessStack,
+    MAX_PREIMAGE_CANDIDATES,
+    type PreimageVerifierInput,
+} from "./preimage-verifier";
 
 export interface VerifyVtxoInput {
     readonly vtxoId: Outpoint;
@@ -120,6 +140,28 @@ export async function verifyVtxo(
                 signal: input.options?.signal,
             });
             checks.push(...sigChecks);
+
+            // Stage 3: Tier 2 — script / timelock / preimage verifiers.
+            // Only run when the caller opts in with tier: "script" or "full".
+            if (tier === "script" || tier === "full") {
+                const scriptOut = await verifyScripts({
+                    path: sigPath,
+                    dag: dagAdapter,
+                    signal: input.options?.signal,
+                });
+                checks.push(...scriptOut.checks);
+                for (const e of scriptOut.errors) errors.push(e);
+                const tlChecks = await verifyTimelocks({
+                    path: sigPath,
+                    signal: input.options?.signal,
+                });
+                checks.push(...tlChecks);
+                const piChecks = await verifyPreimages({
+                    path: sigPath,
+                    signal: input.options?.signal,
+                });
+                checks.push(...piChecks);
+            }
         } else {
             errors.push({
                 kind: "UNSUPPORTED",

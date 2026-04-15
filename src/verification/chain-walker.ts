@@ -594,6 +594,90 @@ export async function walkChain(
         },
     });
 
+    // chain.output-script-tree-ok (P4): for every off-chain node that
+    // carries a VtxoTaprootTree PSBT field on any input, confirm the
+    // tree blob decodes without error. Deep containment (the executed
+    // tapleaf is IN the tree) is checked by the script verifier's
+    // script.vtxotaprootree-valid row — this walker row is the cheap
+    // structural sanity check.
+    const scriptTreeStart = Date.now();
+    let scriptTreeChecked = 0;
+    let scriptTreeFailed = 0;
+    const scriptTreeDetails: string[] = [];
+    for (const node of path) {
+        if (node.type === ChainTxType.COMMITMENT) continue;
+        const parsedTx = parsed.get(node.txid);
+        if (!parsedTx) continue;
+        for (let j = 0; j < parsedTx.inputsLength; j++) {
+            const inp = parsedTx.getInput(j);
+            const unknownMap = (inp as { unknown?: unknown }).unknown;
+            if (!Array.isArray(unknownMap)) continue;
+            for (const pair of unknownMap as Array<
+                [unknown, Uint8Array | undefined]
+            >) {
+                const key = pair[0];
+                const blob = pair[1];
+                const t =
+                    key && typeof key === "object" && "type" in key
+                        ? (key as { type?: unknown }).type
+                        : undefined;
+                if (t !== 0x00) continue; // VtxoTaprootTree field type
+                if (!(blob instanceof Uint8Array)) {
+                    scriptTreeFailed++;
+                    scriptTreeDetails.push(
+                        `${node.txid} input ${j} VtxoTaprootTree blob is not bytes`
+                    );
+                    continue;
+                }
+                scriptTreeChecked++;
+                // Shape check: the blob is a concatenation of
+                // varint(len)||script||leafVersion entries. Just walk
+                // the frame without hashing.
+                try {
+                    let i = 0;
+                    while (i < blob.length) {
+                        const first = blob[i];
+                        let len: number;
+                        let off: number;
+                        if (first < 0xfd) {
+                            len = first;
+                            off = 1;
+                        } else if (first === 0xfd) {
+                            len = blob[i + 1] | (blob[i + 2] << 8);
+                            off = 3;
+                        } else {
+                            throw new Error("unsupported varint");
+                        }
+                        i += off;
+                        if (i + len + 1 > blob.length)
+                            throw new Error("leaf truncated");
+                        i += len + 1;
+                    }
+                } catch (e) {
+                    scriptTreeFailed++;
+                    scriptTreeDetails.push(
+                        `${node.txid} input ${j} VtxoTaprootTree malformed: ${e instanceof Error ? e.message : String(e)}`
+                    );
+                }
+            }
+        }
+    }
+    checks.push({
+        name: "chain.output-script-tree-ok",
+        passed: scriptTreeFailed === 0,
+        details:
+            scriptTreeChecked === 0
+                ? "No VtxoTaprootTree PSBT fields in DAG (trivially ok)"
+                : scriptTreeFailed === 0
+                  ? `All ${scriptTreeChecked} VtxoTaprootTree field(s) decode cleanly`
+                  : scriptTreeDetails.join("; "),
+        durationMs: Date.now() - scriptTreeStart,
+        evidence: {
+            fields_checked: scriptTreeChecked,
+            fields_failed: scriptTreeFailed,
+        },
+    });
+
     // chain.checkpoint-csv-coherent (§3.1.1 sweep-delay coherence, P2).
     // For every CHECKPOINT node, decode its input 0 nSequence via BIP 68
     // and confirm every checkpoint agrees on block count. If

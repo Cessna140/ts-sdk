@@ -1,5 +1,10 @@
+import { hex } from "@scure/base";
 import type { NetworkName } from "../networks";
 import { Coin } from "../wallet";
+
+function hexDecode(s: string): Uint8Array {
+    return hex.decode(s);
+}
 
 /**
  * The default base URLs for esplora API providers.
@@ -23,6 +28,17 @@ export type ExplorerTransaction = {
         block_time: number;
     };
 };
+
+/**
+ * A single on-chain output returned by {@link OnchainProvider.getTxOutputs}.
+ * `script` is the raw scriptPubKey bytes (hex-decoded); `amount` is in
+ * satoshis. Used by the verification module's anchor verifier to
+ * byte-compare against the ASP-claimed batch output.
+ */
+export interface TxOutput {
+    readonly script: Uint8Array;
+    readonly amount: bigint;
+}
 
 export interface OnchainProvider {
     /**
@@ -109,6 +125,13 @@ export interface OnchainProvider {
         addresses: string[],
         eventCallback: (txs: ExplorerTransaction[]) => void
     ): Promise<() => void>;
+    /**
+     * Fetch every vout of the given transaction, returned as
+     * {@link TxOutput}[] indexed by vout. Used by the verification
+     * module's anchor verifier to byte-compare the on-chain batch
+     * output against the ASP's claim.
+     */
+    getTxOutputs(txid: string): Promise<readonly TxOutput[]>;
 }
 
 /**
@@ -165,6 +188,40 @@ export class EsploraProvider implements OnchainProvider {
             default:
                 throw new Error("Only 1 or 1C1P package can be broadcast");
         }
+    }
+
+    async getTxOutputs(txid: string): Promise<readonly TxOutput[]> {
+        const response = await fetch(`${this.baseUrl}/tx/${txid}`);
+        if (!response.ok) {
+            throw new Error(
+                `Failed to fetch tx ${txid} from ${this.baseUrl}: ${response.statusText}`
+            );
+        }
+        const tx = (await response.json()) as {
+            vout?: Array<{ scriptpubkey?: string; value?: number }>;
+        };
+        if (!Array.isArray(tx.vout)) {
+            throw new Error(
+                `Esplora response for tx ${txid} has no vout array`
+            );
+        }
+        const outs: TxOutput[] = [];
+        for (let i = 0; i < tx.vout.length; i++) {
+            const v = tx.vout[i];
+            if (
+                typeof v.scriptpubkey !== "string" ||
+                typeof v.value !== "number"
+            ) {
+                throw new Error(
+                    `Esplora response for tx ${txid} vout[${i}] missing scriptpubkey/value`
+                );
+            }
+            outs.push({
+                script: hexDecode(v.scriptpubkey),
+                amount: BigInt(v.value),
+            });
+        }
+        return outs;
     }
 
     async getTxOutspends(

@@ -23,6 +23,7 @@ import type {
     VtxoChain,
 } from "../../src/providers/indexer";
 import { ChainTxType } from "../../src/providers/indexer";
+import type { OnchainProvider, TxOutput } from "../../src/providers/onchain";
 import type { Outpoint } from "../../src/wallet";
 
 /** A key-path Taproot output: OP_1 + 32-byte x-only pubkey. */
@@ -494,5 +495,66 @@ export function makeMockIndexerProvider(
         getAssetDetails: stub("getAssetDetails") as any,
         subscribeForScripts: vi.fn(async () => ""),
         unsubscribeForScripts: vi.fn(async () => {}),
+    };
+}
+
+/**
+ * Mock onchain provider for verifyAnchor / resolveCommitments tests.
+ * `txOutputsByTxid` keyed by hex txid → array of {script, amount} (one
+ * per vout). `outspendsByTxid` similarly for spent/unspent per vout.
+ */
+export interface MockOnchainOptions {
+    chainTip?: { height: number; time: number; hash: string };
+    txStatus?: Record<
+        string,
+        | { confirmed: false }
+        | { confirmed: true; blockTime: number; blockHeight: number }
+    >;
+    txOutputsByTxid?: Record<string, TxOutput[]>;
+    outspendsByTxid?: Record<string, Array<{ spent: boolean; txid: string }>>;
+    chainTipError?: Error;
+    txStatusError?: Error;
+    txOutputsError?: Error;
+    outspendsError?: Error;
+}
+
+export function makeMockOnchainProvider(
+    opts: MockOnchainOptions = {}
+): OnchainProvider {
+    const tip = opts.chainTip ?? {
+        height: 200,
+        time: 1_700_003_600,
+        hash: "00".repeat(32),
+    };
+    return {
+        getCoins: vi.fn(async () => []),
+        getFeeRate: vi.fn(async () => 1),
+        broadcastTransaction: vi.fn(
+            async () => ""
+        ) as unknown as OnchainProvider["broadcastTransaction"],
+        getTxOutspends: vi.fn(async (txid: string) => {
+            if (opts.outspendsError) throw opts.outspendsError;
+            return opts.outspendsByTxid?.[txid] ?? [{ spent: false, txid: "" }];
+        }),
+        getTransactions: vi.fn(async () => []),
+        getTxStatus: vi.fn(async (txid: string) => {
+            if (opts.txStatusError) throw opts.txStatusError;
+            return (
+                opts.txStatus?.[txid] ?? {
+                    confirmed: true as const,
+                    blockTime: 1_700_000_000,
+                    blockHeight: 100,
+                }
+            );
+        }),
+        getChainTip: vi.fn(async () => {
+            if (opts.chainTipError) throw opts.chainTipError;
+            return tip;
+        }),
+        watchAddresses: vi.fn(async () => () => {}),
+        getTxOutputs: vi.fn(async (txid: string) => {
+            if (opts.txOutputsError) throw opts.txOutputsError;
+            return opts.txOutputsByTxid?.[txid] ?? [];
+        }),
     };
 }

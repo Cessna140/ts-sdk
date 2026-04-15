@@ -31,7 +31,11 @@ import {
     makeSignaturePathEntry,
     type Prevout,
 } from "../../src/verification/types";
-import { buildMockChain, makeMockIndexerProvider } from "./helpers";
+import {
+    buildMockChain,
+    makeMockIndexerProvider,
+    makeMockOnchainProvider,
+} from "./helpers";
 
 function sigPathFromVirtualTxs(virtualTxs: string[]) {
     return virtualTxs.map((psbt) => {
@@ -139,9 +143,16 @@ describe("P4: pipeline Tier 2 wiring", () => {
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,
-            onchainProvider: {} as Parameters<
-                typeof verifyVtxo
-            >[0]["onchainProvider"],
+            onchainProvider: makeMockOnchainProvider({
+                txOutputsByTxid: {
+                    [fx.commitmentTxid]: [
+                        {
+                            script: new Uint8Array(34).fill(0x51),
+                            amount: 100_000n,
+                        },
+                    ],
+                },
+            }),
         });
         expect(result.checks.length).toBe(13);
         expect(
@@ -158,16 +169,29 @@ describe("P4: pipeline Tier 2 wiring", () => {
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,
-            onchainProvider: {} as Parameters<
-                typeof verifyVtxo
-            >[0]["onchainProvider"],
+            onchainProvider: makeMockOnchainProvider({
+                txOutputsByTxid: {
+                    [fx.commitmentTxid]: [
+                        {
+                            script: new Uint8Array(34).fill(0x51),
+                            amount: 100_000n,
+                        },
+                    ],
+                },
+            }),
             options: { tier: "full" },
         });
         expect(result.checks.length).toBe(22);
         for (const c of result.checks) {
             expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
         }
-        expect(result.valid).toBe(true);
+        // Anchor resolver fails on key-path-only fixture (no CLTV
+        // source); captured honestly as errors[] rather than a throw.
+        expect(
+            result.errors.some(
+                (e) => e.code === "anchor.commitment-resolve-failed"
+            )
+        ).toBe(true);
     });
 
     it("tier: 'script' also emits 22 rows (alias for Tier 2 enabled)", async () => {
@@ -179,9 +203,16 @@ describe("P4: pipeline Tier 2 wiring", () => {
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,
-            onchainProvider: {} as Parameters<
-                typeof verifyVtxo
-            >[0]["onchainProvider"],
+            onchainProvider: makeMockOnchainProvider({
+                txOutputsByTxid: {
+                    [fx.commitmentTxid]: [
+                        {
+                            script: new Uint8Array(34).fill(0x51),
+                            amount: 100_000n,
+                        },
+                    ],
+                },
+            }),
             options: { tier: "script" },
         });
         expect(result.checks.length).toBe(22);
@@ -198,9 +229,16 @@ describe("P4: chain.output-script-tree-ok (9th chain check)", () => {
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,
-            onchainProvider: {} as Parameters<
-                typeof verifyVtxo
-            >[0]["onchainProvider"],
+            onchainProvider: makeMockOnchainProvider({
+                txOutputsByTxid: {
+                    [fx.commitmentTxid]: [
+                        {
+                            script: new Uint8Array(34).fill(0x51),
+                            amount: 100_000n,
+                        },
+                    ],
+                },
+            }),
         });
         const st = result.checks.find(
             (c) => c.name === "chain.output-script-tree-ok"

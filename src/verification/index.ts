@@ -35,6 +35,11 @@ import { verifySignatures } from "./signature-verifier";
 import { verifyScripts } from "./script-verifier";
 import { verifyTimelocks } from "./timelock-verifier";
 import { verifyPreimages } from "./preimage-verifier";
+import {
+    extractCommitmentTapleafScripts,
+    resolveCommitments,
+    verifyAnchor,
+} from "./anchor-verifier";
 import type {
     CheckResult,
     Prevout,
@@ -81,6 +86,16 @@ export {
     MAX_PREIMAGE_CANDIDATES,
     type PreimageVerifierInput,
 } from "./preimage-verifier";
+export {
+    verifyAnchor,
+    resolveCommitments,
+    extractCommitmentTapleafScripts,
+    anchorVoutInRange,
+    DEFAULT_MIN_CONFIRMATIONS,
+    DEFAULT_NEAR_EXPIRY_BLOCKS,
+    type AnchorVerifierInput,
+    type CommitmentTapleafMap,
+} from "./anchor-verifier";
 
 export interface VerifyVtxoInput {
     readonly vtxoId: Outpoint;
@@ -141,7 +156,46 @@ export async function verifyVtxo(
             });
             checks.push(...sigChecks);
 
-            // Stage 3: Tier 2 — script / timelock / preimage verifiers.
+            // Stage 3: anchor — resolve commitments to on-chain outputs
+            // + CLTV parse, then emit 4 anchor.* check rows.
+            // Build commitment->tapleaf map from the DAG (B3 iterator)
+            // so the CLTV parser sees the sweep leaf, not the P2TR
+            // scriptPubKey (which has no OP_CLTV).
+            const tapleafMap = extractCommitmentTapleafScripts(
+                walker.commitments,
+                (txid) => {
+                    const node = walker.dag.nodes.get(txid);
+                    return node?.tx;
+                },
+                dagAdapter.commitmentParentedInputs()
+            );
+            const resolved = await resolveCommitments(
+                walker.commitments,
+                input.onchainProvider,
+                tapleafMap,
+                input.options?.signal
+            );
+            if (resolved.ok) {
+                try {
+                    const anchorChecks = await verifyAnchor({
+                        commitments: resolved.value,
+                        onchainProvider: input.onchainProvider,
+                        minConfirmations: input.options?.minConfirmations,
+                        signal: input.options?.signal,
+                    });
+                    checks.push(...anchorChecks);
+                } catch (e) {
+                    recordThrown(e, errors);
+                }
+            } else {
+                errors.push({
+                    kind: "DATA",
+                    code: "anchor.commitment-resolve-failed",
+                    message: resolved.error,
+                });
+            }
+
+            // Stage 4: Tier 2 — script / timelock / preimage verifiers.
             // Only run when the caller opts in with tier: "script" or "full".
             if (tier === "script" || tier === "full") {
                 const scriptOut = await verifyScripts({

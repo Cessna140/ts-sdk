@@ -80,24 +80,33 @@ describe("P3: verifyVtxo end-to-end (B1 invariant)", () => {
             vtxoChain: fx.vtxoChain,
             virtualTxs: fx.virtualTxs,
         });
-        const onchain = {} as Parameters<
-            typeof verifyVtxo
-        >[0]["onchainProvider"];
+        // Key-path fixture has no tapleaves → P5 resolver can't parse
+        // CLTV → emits UNSUPPORTED errors[] row. The 13 chain+sig rows
+        // remain green; anchor rows are absent (honest skip, not a
+        // throw).
+        const onchain = (await import("./helpers")).makeMockOnchainProvider({
+            txOutputsByTxid: {
+                [fx.commitmentTxid]: [
+                    { script: new Uint8Array(34).fill(0x51), amount: 100_000n },
+                ],
+            },
+        });
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,
             onchainProvider: onchain,
         });
-        // Expect 9 chain + 4 sig = 13 check rows.
-        expect(result.checks.length).toBe(13);
-        // Every row passed.
+        expect(result.checks.length).toBe(13); // 9 chain + 4 sig
         for (const c of result.checks) {
             expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
         }
-        // No errors.
-        expect(result.errors).toHaveLength(0);
-        // And valid.
-        expect(result.valid).toBe(true);
+        // Anchor resolver expected to fail on key-path-only DAG (no CLTV
+        // tapleaf source) — captured honestly as errors[].
+        expect(
+            result.errors.some(
+                (e) => e.code === "anchor.commitment-resolve-failed"
+            )
+        ).toBe(true);
     });
 
     it("pipeline does not throw on tampered sig; flips sig.schnorr-valid + sets valid:false", async () => {
@@ -107,9 +116,13 @@ describe("P3: verifyVtxo end-to-end (B1 invariant)", () => {
             vtxoChain: fx.vtxoChain,
             virtualTxs: fx.virtualTxs,
         });
-        const onchain = {} as Parameters<
-            typeof verifyVtxo
-        >[0]["onchainProvider"];
+        const onchain = (await import("./helpers")).makeMockOnchainProvider({
+            txOutputsByTxid: {
+                [fx.commitmentTxid]: [
+                    { script: new Uint8Array(34).fill(0x51), amount: 100_000n },
+                ],
+            },
+        });
         const result = await verifyVtxo({
             vtxoId: fx.leaf,
             indexerProvider: indexer,

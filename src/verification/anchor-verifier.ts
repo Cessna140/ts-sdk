@@ -22,6 +22,7 @@
 
 import type { OnchainProvider } from "../providers/onchain";
 import { ProviderUnavailableError } from "./errors";
+import { VtxoTreeExpiry } from "../utils/unknownFields";
 import type {
     BlockHeight,
     CheckResult,
@@ -30,7 +31,12 @@ import type {
     Txid,
     UnresolvedCommitmentInfo,
 } from "./types";
-import { err, ok, parseCLTVFromCommitmentScript } from "./types";
+import {
+    blockHeightFromRelativeDelay,
+    err,
+    ok,
+    parseCLTVFromCommitmentScript,
+} from "./types";
 
 /** Default minimum confirmations required for `anchor.commitment-confirmed`. */
 export const DEFAULT_MIN_CONFIRMATIONS = 6;
@@ -63,6 +69,20 @@ export interface AnchorVerifierInput {
 export type CommitmentTapleafMap = ReadonlyMap<Txid, Uint8Array>;
 
 /**
+ * Per-commitment pre-computed absolute-height expiries. When present,
+ * the resolver uses these values directly and skips CLTV tapleaf
+ * parsing for that commitment. The pipeline prefers this source for
+ * arkd-issued VTXOs which express expiry via the BIP 68-relative
+ * `VtxoTreeExpiry` PSBT field rather than an absolute CLTV tapleaf.
+ *
+ * Values must be constructed via
+ * {@link blockHeightFromRelativeDelay} or
+ * {@link parseCLTVFromCommitmentScript} (B9 invariant — no
+ * silent-default path).
+ */
+export type CommitmentExpiryMap = ReadonlyMap<Txid, BlockHeight>;
+
+/**
  * Resolve an {@link UnresolvedCommitmentInfo} to a
  * {@link ResolvedCommitmentInfo} using the on-chain provider + a
  * per-commitment tapleaf-script map (for CLTV expiry parsing).
@@ -83,6 +103,7 @@ export async function resolveCommitments(
     unresolved: readonly UnresolvedCommitmentInfo[],
     onchain: OnchainProvider,
     commitmentTapleafScripts: CommitmentTapleafMap,
+    commitmentExpiryHeights: CommitmentExpiryMap,
     signal?: AbortSignal
 ): Promise<Result<readonly ResolvedCommitmentInfo[], string>> {
     const out: ResolvedCommitmentInfo[] = [];
@@ -96,19 +117,26 @@ export async function resolveCommitments(
                 `getTxOutputs failed for ${u.txid}: ${e instanceof Error ? e.message : String(e)}`
             );
         }
-        const tapleaf = commitmentTapleafScripts.get(u.txid);
-        if (!tapleaf) {
-            return err(
-                `commitment ${u.txid} has no tapleaf script source for CLTV parse (B9 requires parseCLTVFromCommitmentScript); key-path-only paths cannot resolve expiry without a sweep tapleaf`
-            );
-        }
-        let expiry: BlockHeight;
-        try {
-            expiry = parseCLTVFromCommitmentScript(tapleaf);
-        } catch (e) {
-            return err(
-                `commitment ${u.txid} CLTV parse failed: ${e instanceof Error ? e.message : String(e)}`
-            );
+        // Resolve expiry: prefer pre-computed height map (arkd's
+        // VtxoTreeExpiry path), fall back to tapleaf CLTV parse for
+        // non-arkd/synthetic chains.
+        let expiry: BlockHeight | undefined = commitmentExpiryHeights.get(
+            u.txid
+        );
+        if (expiry === undefined) {
+            const tapleaf = commitmentTapleafScripts.get(u.txid);
+            if (!tapleaf) {
+                return err(
+                    `commitment ${u.txid} has no expiry source: neither VtxoTreeExpiry pre-computed height nor a tapleaf CLTV is available (B9 requires an explicit source)`
+                );
+            }
+            try {
+                expiry = parseCLTVFromCommitmentScript(tapleaf);
+            } catch (e) {
+                return err(
+                    `commitment ${u.txid} CLTV parse failed: ${e instanceof Error ? e.message : String(e)}`
+                );
+            }
         }
         for (const vout of u.claimedVouts) {
             if (vout < 0 || vout >= outputs.length) {
@@ -386,6 +414,102 @@ export function anchorVoutInRange(
         durationMs: 0,
         evidence: { vout, outputs_length: outputsLength },
     };
+}
+
+/**
+ * Walk every COMMITMENT-parented input in the DAG, read the
+ * `VtxoTreeExpiry` PSBT unknown field, and build a
+ * {@link CommitmentExpiryMap} keyed by commitment txid. Requires the
+ * commitment's on-chain confirmation height so BIP 68 relative delays
+ * can be resolved to absolute heights via
+ * {@link blockHeightFromRelativeDelay}.
+ *
+ * Returns an empty map for commitments that carry no VtxoTreeExpiry
+ * field — the resolver then falls back to tapleaf CLTV parsing.
+ */
+export async function extractCommitmentExpiryHeights(
+    commitments: readonly UnresolvedCommitmentInfo[],
+    dagNodeParsedTx: (txid: Txid) => unknown | undefined,
+    commitmentParentedInputs: IterableIterator<{
+        childTxid: Txid;
+        inputIndex: number;
+        commitmentTxid: Txid;
+    }>,
+    onchain: OnchainProvider
+): Promise<CommitmentExpiryMap> {
+    const expiryByCommitment = new Map<Txid, BlockHeight>();
+    // Group edges by commitment to avoid redundant getTxStatus calls.
+    const edgesByCommitment = new Map<
+        Txid,
+        { childTxid: Txid; inputIndex: number }[]
+    >();
+    for (const edge of commitmentParentedInputs) {
+        const arr =
+            edgesByCommitment.get(edge.commitmentTxid) ??
+            edgesByCommitment
+                .set(edge.commitmentTxid, [])
+                .get(edge.commitmentTxid)!;
+        arr.push({ childTxid: edge.childTxid, inputIndex: edge.inputIndex });
+    }
+
+    for (const c of commitments) {
+        const edges = edgesByCommitment.get(c.txid);
+        if (!edges || edges.length === 0) continue;
+        // Pick any child and read its VtxoTreeExpiry field via the
+        // SDK's VtxoTreeExpiry coder.
+        let relativeBlocks: number | undefined;
+        for (const edge of edges) {
+            const tx = dagNodeParsedTx(edge.childTxid) as
+                | {
+                      getInput: (i: number) => {
+                          unknown?: Array<[unknown, Uint8Array | undefined]>;
+                      };
+                  }
+                | undefined;
+            if (!tx) continue;
+            const inp = tx.getInput(edge.inputIndex);
+            if (!Array.isArray(inp.unknown)) continue;
+            for (const pair of inp.unknown) {
+                const decoded = VtxoTreeExpiry.decode(
+                    pair as unknown as Parameters<
+                        typeof VtxoTreeExpiry.decode
+                    >[0]
+                );
+                if (!decoded) continue;
+                // Only accept block-based relative delay — B9 invariant
+                // forbids silent seconds→blocks conversion (that was
+                // v1's 600s/block heuristic bug). arkd regtest emits
+                // seconds-based expiry which we intentionally skip;
+                // verifier reports UNSUPPORTED rather than fabricating
+                // a BlockHeight.
+                if (decoded.type !== "blocks") continue;
+                relativeBlocks = Number(decoded.value);
+                break;
+            }
+            if (relativeBlocks !== undefined) break;
+        }
+        if (relativeBlocks === undefined) continue;
+        // Fetch commitment's confirmation height to compute absolute.
+        let confHeight: number;
+        try {
+            const status = await onchain.getTxStatus(c.txid);
+            if (!status.confirmed) continue; // unconfirmed → skip; anchor check catches it separately
+            confHeight = status.blockHeight;
+        } catch {
+            continue;
+        }
+        try {
+            expiryByCommitment.set(
+                c.txid,
+                blockHeightFromRelativeDelay(relativeBlocks, confHeight)
+            );
+        } catch {
+            // B9-compatible constructor rejected the input — skip; the
+            // resolver will surface a clearer error when it can't find
+            // either expiry source.
+        }
+    }
+    return expiryByCommitment;
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

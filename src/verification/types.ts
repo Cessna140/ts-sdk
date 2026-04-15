@@ -80,11 +80,55 @@ export function txidFromString(hex: string): Txid {
 }
 
 /**
- * Branded absolute Bitcoin block height. Sole constructor is
- * {@link parseCLTVFromCommitmentScript} — a BlockHeight cannot be produced
- * from an ISO timestamp + 600s/block heuristic (bug B9 from v1 self-review).
+ * Branded absolute Bitcoin block height. B9 invariant: a BlockHeight
+ * can ONLY be produced via one of two named constructors:
+ *   - {@link parseCLTVFromCommitmentScript}(tapleaf) — for protocols that
+ *     encode expiry as an absolute-CLTV tapleaf (BIP 65 `<h> OP_CLTV`).
+ *   - {@link blockHeightFromRelativeDelay}(blocks, confirmationHeight) —
+ *     for protocols (including arkd) that express expiry as a BIP 68
+ *     relative block delay via the `VtxoTreeExpiry` PSBT field;
+ *     absolute height = commitment's on-chain confirmation height +
+ *     delay.
+ *
+ * No ISO-timestamp / 600s-heuristic constructor exists — that was v1's
+ * B9 bug.
  */
 export type BlockHeight = number & { readonly __brand: "block-height" };
+
+/**
+ * Construct a BlockHeight from a BIP 68 relative block delay + the
+ * commitment's on-chain confirmation height. This is how arkd's
+ * `VtxoTreeExpiry` PSBT field maps to an absolute batch-expiry height.
+ *
+ * @param relativeBlocks Block delta from the VtxoTreeExpiry field.
+ * @param commitmentConfirmationHeight The block height at which the
+ *   commitment tx itself is confirmed on-chain.
+ */
+export function blockHeightFromRelativeDelay(
+    relativeBlocks: number,
+    commitmentConfirmationHeight: number
+): BlockHeight {
+    if (!Number.isInteger(relativeBlocks) || relativeBlocks < 0) {
+        throw new Error(
+            `blockHeightFromRelativeDelay: invalid relativeBlocks ${relativeBlocks}`
+        );
+    }
+    if (
+        !Number.isInteger(commitmentConfirmationHeight) ||
+        commitmentConfirmationHeight < 0
+    ) {
+        throw new Error(
+            `blockHeightFromRelativeDelay: invalid commitmentConfirmationHeight ${commitmentConfirmationHeight}`
+        );
+    }
+    const abs = relativeBlocks + commitmentConfirmationHeight;
+    if (abs >= CLTV_HEIGHT_THRESHOLD) {
+        throw new Error(
+            `blockHeightFromRelativeDelay: absolute height ${abs} >= CLTV_HEIGHT_THRESHOLD ${CLTV_HEIGHT_THRESHOLD}`
+        );
+    }
+    return abs as BlockHeight;
+}
 
 /** Per BIP 65, absolute block-height CLTV values must be < 500_000_000. */
 export const CLTV_HEIGHT_THRESHOLD = 500_000_000;

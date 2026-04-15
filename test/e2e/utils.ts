@@ -19,7 +19,9 @@ import { RestDelegatorProvider } from "../../src/providers/delegator";
 import { generateMnemonic } from "@scure/bip39";
 import { wordlist } from "@scure/bip39/wordlists/english.js";
 
-export const arkdExec = "docker exec -t arkd";
+// nigiri 0.5.16 renamed the arkd container from "arkd" → "ark"; the
+// arkd binary lives in the "ark" container (see `docker ps`).
+export const arkdExec = "docker exec -t ark";
 
 let arkCliInitialized = false;
 

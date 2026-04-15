@@ -156,7 +156,12 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
             { txid: txidFromString(txid), claimedVouts: [0, 1] },
         ];
         const tapleafMap = new Map([[txidFromString(txid), CLTV_144_TAPLEAF]]);
-        const res = await resolveCommitments(unresolved, onchain, tapleafMap);
+        const res = await resolveCommitments(
+            unresolved,
+            onchain,
+            tapleafMap,
+            new Map()
+        );
         expect(res.ok).toBe(true);
         if (res.ok) {
             expect(res.value).toHaveLength(2); // one per claimed vout (bug #8 fix)
@@ -178,10 +183,15 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
             { txid: txidFromString(txid), claimedVouts: [0] },
         ];
         const emptyMap = new Map();
-        const res = await resolveCommitments(unresolved, onchain, emptyMap);
+        const res = await resolveCommitments(
+            unresolved,
+            onchain,
+            emptyMap,
+            new Map()
+        );
         expect(res.ok).toBe(false);
         if (!res.ok) {
-            expect(res.error).toMatch(/no tapleaf script source/);
+            expect(res.error).toMatch(/no expiry source/);
         }
     });
 
@@ -196,7 +206,12 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
             { txid: txidFromString(txid), claimedVouts: [5] }, // only 1 output
         ];
         const tapleafMap = new Map([[txidFromString(txid), CLTV_144_TAPLEAF]]);
-        const res = await resolveCommitments(unresolved, onchain, tapleafMap);
+        const res = await resolveCommitments(
+            unresolved,
+            onchain,
+            tapleafMap,
+            new Map()
+        );
         expect(res.ok).toBe(false);
         if (!res.ok) expect(res.error).toMatch(/vout 5 out of range/);
     });
@@ -216,7 +231,12 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
         const unresolved: UnresolvedCommitmentInfo[] = [
             { txid: txidFromString(txid), claimedVouts: [0] },
         ];
-        const res = await resolveCommitments(unresolved, onchain, tapleafMap);
+        const res = await resolveCommitments(
+            unresolved,
+            onchain,
+            tapleafMap,
+            new Map()
+        );
         expect(res.ok).toBe(false);
         if (!res.ok) expect(res.error).toMatch(/CLTV parse failed/);
     });
@@ -263,7 +283,7 @@ describe("P5: pipeline end-to-end", () => {
             (e) => e.code === "anchor.commitment-resolve-failed"
         );
         expect(resolveErr).toBeDefined();
-        expect(resolveErr?.message).toMatch(/no tapleaf script source/);
+        expect(resolveErr?.message).toMatch(/no expiry source/);
         // Pipeline did not throw.
         expect(result.valid).toBe(false); // errors[] non-empty → valid: false
     });

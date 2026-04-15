@@ -36,6 +36,7 @@ import { verifyScripts } from "./script-verifier";
 import { verifyTimelocks } from "./timelock-verifier";
 import { verifyPreimages } from "./preimage-verifier";
 import {
+    extractCommitmentExpiryHeights,
     extractCommitmentTapleafScripts,
     resolveCommitments,
     verifyAnchor,
@@ -141,14 +142,69 @@ export async function verifyVtxo(
     }
     checks.push(...walker.checks);
 
-    // Stage 2: signatures — build SignaturePathEntry[] from the walker's
-    // parsed off-chain nodes. Commitment-adjacent inputs whose prevouts
-    // aren't resolvable yet (P5 work) are marked UNSUPPORTED and the
-    // tx is skipped for sig verification so the trace stays coherent.
+    // Stage 2: resolve commitments FIRST so we can use the resolved
+    // on-chain prevouts (batchScript + batchAmount at the claimed vout)
+    // when assembling per-input prevouts for the sig verifier. Real
+    // arkd PSBTs do NOT populate witnessUtxo on commitment-adjacent
+    // inputs; the DAG+resolver combo is how the pipeline fills that
+    // gap.
+    const dagAdapter = makeDagAdapter(walker.dag);
+    const tapleafMap = extractCommitmentTapleafScripts(
+        walker.commitments,
+        (txid) => walker.dag.nodes.get(txid)?.tx,
+        dagAdapter.commitmentParentedInputs()
+    );
+    // Prefer VtxoTreeExpiry PSBT field for arkd-issued VTXOs (relative
+    // delay + confirmation height); fall back to tapleaf CLTV parsing
+    // in the resolver for protocols that encode expiry absolutely.
+    const expiryHeightMap = await extractCommitmentExpiryHeights(
+        walker.commitments,
+        (txid) => walker.dag.nodes.get(txid)?.tx,
+        dagAdapter.commitmentParentedInputs(),
+        input.onchainProvider
+    );
+    const resolved = await resolveCommitments(
+        walker.commitments,
+        input.onchainProvider,
+        tapleafMap,
+        expiryHeightMap,
+        input.options?.signal
+    );
+    const resolvedCommitmentsByTxid = new Map<
+        string,
+        { script: Uint8Array; amount: bigint }
+    >();
+    if (resolved.ok) {
+        for (const c of resolved.value) {
+            // Key by txid + vout since multiple vouts per commitment possible.
+            resolvedCommitmentsByTxid.set(`${c.txid}:${c.vout}`, {
+                script: c.batchScript,
+                amount: c.batchAmount,
+            });
+        }
+    } else {
+        // Surface the resolver error immediately so downstream sees it
+        // regardless of whether sigPath assembly succeeds.
+        errors.push({
+            kind: "DATA",
+            code: "anchor.commitment-resolve-failed",
+            message: resolved.error,
+        });
+    }
+
+    // Stage 3: signatures — build SignaturePathEntry[] using per-input
+    // prevouts resolved from (a) the input's PSBT witnessUtxo when
+    // present, (b) the DAG parent's output when off-chain, (c) the
+    // resolved commitment's batchScript/batchAmount when the parent is
+    // on-chain.
     try {
-        const sigPath = assembleSignaturePath(walker.path, errors);
+        const sigPath = assembleSignaturePath(
+            walker.path,
+            walker.dag.parents,
+            resolvedCommitmentsByTxid,
+            errors
+        );
         if (sigPath.length > 0) {
-            const dagAdapter = makeDagAdapter(walker.dag);
             const sigChecks = await verifySignatures({
                 path: sigPath,
                 dag: dagAdapter,
@@ -156,25 +212,9 @@ export async function verifyVtxo(
             });
             checks.push(...sigChecks);
 
-            // Stage 3: anchor — resolve commitments to on-chain outputs
-            // + CLTV parse, then emit 4 anchor.* check rows.
-            // Build commitment->tapleaf map from the DAG (B3 iterator)
-            // so the CLTV parser sees the sweep leaf, not the P2TR
-            // scriptPubKey (which has no OP_CLTV).
-            const tapleafMap = extractCommitmentTapleafScripts(
-                walker.commitments,
-                (txid) => {
-                    const node = walker.dag.nodes.get(txid);
-                    return node?.tx;
-                },
-                dagAdapter.commitmentParentedInputs()
-            );
-            const resolved = await resolveCommitments(
-                walker.commitments,
-                input.onchainProvider,
-                tapleafMap,
-                input.options?.signal
-            );
+            // Stage 4: anchor — emit 4 anchor.* check rows using the
+            // resolved commitments. Resolver failure already recorded
+            // above; just skip if resolved.ok is false.
             if (resolved.ok) {
                 try {
                     const anchorChecks = await verifyAnchor({
@@ -187,15 +227,11 @@ export async function verifyVtxo(
                 } catch (e) {
                     recordThrown(e, errors);
                 }
-            } else {
-                errors.push({
-                    kind: "DATA",
-                    code: "anchor.commitment-resolve-failed",
-                    message: resolved.error,
-                });
             }
+            // else: resolver error already recorded above when we built
+            // resolvedCommitmentsByTxid.
 
-            // Stage 4: Tier 2 — script / timelock / preimage verifiers.
+            // Stage 5: Tier 2 — script / timelock / preimage verifiers.
             // Only run when the caller opts in with tier: "script" or "full".
             if (tier === "script" || tier === "full") {
                 const scriptOut = await verifyScripts({
@@ -243,10 +279,42 @@ export async function verifyVtxo(
  * `makeSignaturePathEntry` asserts `prevouts.length === tx.inputsLength`
  * at construction (B1 invariant).
  */
+/**
+ * Resolve per-input prevouts for every off-chain DAG node, using a
+ * three-source lookup order:
+ *
+ *   1. PSBT `witnessUtxo` if present (the common case for off-chain
+ *      signed hops).
+ *   2. DAG parent's parsed-tx output at the claimed vout (off-chain
+ *      parent).
+ *   3. Resolved commitment's batchScript/batchAmount at the claimed
+ *      vout (commitment-adjacent input — v2 pipeline fills the gap
+ *      real arkd PSBTs leave on commitment-spending inputs).
+ *
+ * If all three fail for an input, we emit UNSUPPORTED and skip the
+ * tx. `makeSignaturePathEntry` asserts `prevouts.length === tx.
+ * inputsLength` (B1 invariant).
+ */
 function assembleSignaturePath(
     path: readonly DagNode[],
+    parentsByTxid: ReadonlyMap<string, readonly string[]>,
+    resolvedCommitmentsByVout: ReadonlyMap<
+        string,
+        { script: Uint8Array; amount: bigint }
+    >,
     errors: VerificationError[]
 ): SignaturePathEntry[] {
+    // Build a quick txid → parsed Tx lookup for off-chain DAG nodes.
+    const parsedByTxid = new Map<string, Transaction>();
+    for (const node of path) {
+        if (
+            node.type !== ChainTxType.COMMITMENT &&
+            node.tx instanceof Transaction
+        ) {
+            parsedByTxid.set(node.txid, node.tx);
+        }
+    }
+
     const entries: SignaturePathEntry[] = [];
     for (const node of path) {
         if (node.type === ChainTxType.COMMITMENT) continue;
@@ -260,26 +328,68 @@ function assembleSignaturePath(
             });
             continue;
         }
-        // Attempt to resolve every input's prevout. Stop for this tx if
-        // any input's prevout is unresolvable.
+        const declaredParents = parentsByTxid.get(node.txid) ?? [];
         const prevouts: Prevout[] = [];
         let resolvable = true;
         for (let i = 0; i < tx.inputsLength; i++) {
             const inp = tx.getInput(i);
-            if (!inp?.witnessUtxo) {
-                resolvable = false;
-                errors.push({
-                    kind: "UNSUPPORTED",
-                    code: "sig.prevout-unresolvable",
-                    message: `Tx ${node.txid} input ${i} has no witnessUtxo; commitment-adjacent prevouts land at P5`,
-                    context: { txid: node.txid, input_index: i },
+
+            // (1) PSBT witnessUtxo
+            if (inp?.witnessUtxo) {
+                prevouts.push({
+                    script: inp.witnessUtxo.script,
+                    amount: inp.witnessUtxo.amount,
                 });
-                break;
+                continue;
             }
-            prevouts.push({
-                script: inp.witnessUtxo.script,
-                amount: inp.witnessUtxo.amount,
+
+            const claimedVout = inp?.index;
+
+            // (2) DAG parent's parsed output
+            const parentTxid = declaredParents[i];
+            if (
+                parentTxid &&
+                claimedVout !== undefined &&
+                parsedByTxid.has(parentTxid)
+            ) {
+                const parentTx = parsedByTxid.get(parentTxid)!;
+                if (claimedVout < parentTx.outputsLength) {
+                    const out = parentTx.getOutput(claimedVout);
+                    if (out?.script && out.amount !== undefined) {
+                        prevouts.push({
+                            script: out.script,
+                            amount: out.amount,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // (3) Resolved commitment
+            if (parentTxid && claimedVout !== undefined) {
+                const hit = resolvedCommitmentsByVout.get(
+                    `${parentTxid}:${claimedVout}`
+                );
+                if (hit) {
+                    prevouts.push(hit);
+                    continue;
+                }
+            }
+
+            // All three sources failed — surface diagnostics.
+            resolvable = false;
+            errors.push({
+                kind: "UNSUPPORTED",
+                code: "sig.prevout-unresolvable",
+                message: `Tx ${node.txid} input ${i} has no witnessUtxo, no DAG-parent output, and no resolved commitment — prevout unresolvable`,
+                context: {
+                    txid: node.txid,
+                    input_index: i,
+                    parent_txid: parentTxid,
+                    claimed_vout: claimedVout,
+                },
             });
+            break;
         }
         if (!resolvable) continue;
         try {

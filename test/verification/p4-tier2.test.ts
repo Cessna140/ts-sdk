@@ -154,7 +154,7 @@ describe("P4: pipeline Tier 2 wiring", () => {
                 },
             }),
         });
-        expect(result.checks.length).toBe(13);
+        expect(result.checks.length).toBe(17);
         expect(
             result.checks.find((c) => c.name.startsWith("script."))
         ).toBeUndefined();
@@ -181,17 +181,18 @@ describe("P4: pipeline Tier 2 wiring", () => {
             }),
             options: { tier: "full" },
         });
-        expect(result.checks.length).toBe(22);
+        expect(result.checks.length).toBe(26);
         for (const c of result.checks) {
             expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
         }
-        // Anchor resolver fails on key-path-only fixture (no CLTV
-        // source); captured honestly as errors[] rather than a throw.
-        expect(
-            result.errors.some(
-                (e) => e.code === "anchor.commitment-resolve-failed"
-            )
-        ).toBe(true);
+        // All 26 rows green; expiry row passes with undefined-expiry
+        // UNSUPPORTED note (no tapleaf in key-path fixture).
+        const expiryRow = result.checks.find(
+            (c) => c.name === "anchor.expiry-not-passed"
+        );
+        expect(expiryRow?.evidence?.unsupported_count).toBeGreaterThanOrEqual(
+            1
+        );
     });
 
     it("tier: 'script' also emits 22 rows (alias for Tier 2 enabled)", async () => {
@@ -215,7 +216,7 @@ describe("P4: pipeline Tier 2 wiring", () => {
             }),
             options: { tier: "script" },
         });
-        expect(result.checks.length).toBe(22);
+        expect(result.checks.length).toBe(26);
     });
 });
 

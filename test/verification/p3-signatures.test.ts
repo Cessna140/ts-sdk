@@ -96,17 +96,18 @@ describe("P3: verifyVtxo end-to-end (B1 invariant)", () => {
             indexerProvider: indexer,
             onchainProvider: onchain,
         });
-        expect(result.checks.length).toBe(13); // 9 chain + 4 sig
+        expect(result.checks.length).toBe(17); // 9 chain + 4 sig + 4 anchor
         for (const c of result.checks) {
             expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
         }
-        // Anchor resolver expected to fail on key-path-only DAG (no CLTV
-        // tapleaf source) — captured honestly as errors[].
-        expect(
-            result.errors.some(
-                (e) => e.code === "anchor.commitment-resolve-failed"
-            )
-        ).toBe(true);
+        // Anchor rows run on key-path fixture — expiry row handles
+        // undefined expiry as UNSUPPORTED but still passes.
+        const expiryRow = result.checks.find(
+            (c) => c.name === "anchor.expiry-not-passed"
+        );
+        expect(expiryRow?.evidence?.unsupported_count).toBeGreaterThanOrEqual(
+            1
+        );
     });
 
     it("pipeline does not throw on tampered sig; flips sig.schnorr-valid + sets valid:false", async () => {

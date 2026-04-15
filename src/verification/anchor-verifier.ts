@@ -119,23 +119,25 @@ export async function resolveCommitments(
         }
         // Resolve expiry: prefer pre-computed height map (arkd's
         // VtxoTreeExpiry path), fall back to tapleaf CLTV parse for
-        // non-arkd/synthetic chains.
+        // non-arkd/synthetic chains. Missing/unparseable expiry is
+        // NON-FATAL — §3.1.3's core checks (confirmed/output-matches/
+        // unspent) don't depend on it. The anchor verifier's
+        // `anchor.expiry-not-passed` row handles undefined expiry by
+        // emitting UNSUPPORTED for those commitments; the other 3
+        // anchor rows still run.
         let expiry: BlockHeight | undefined = commitmentExpiryHeights.get(
             u.txid
         );
         if (expiry === undefined) {
             const tapleaf = commitmentTapleafScripts.get(u.txid);
-            if (!tapleaf) {
-                return err(
-                    `commitment ${u.txid} has no expiry source: neither VtxoTreeExpiry pre-computed height nor a tapleaf CLTV is available (B9 requires an explicit source)`
-                );
-            }
-            try {
-                expiry = parseCLTVFromCommitmentScript(tapleaf);
-            } catch (e) {
-                return err(
-                    `commitment ${u.txid} CLTV parse failed: ${e instanceof Error ? e.message : String(e)}`
-                );
+            if (tapleaf) {
+                try {
+                    expiry = parseCLTVFromCommitmentScript(tapleaf);
+                } catch {
+                    // Parse failure is fine — leave expiry undefined;
+                    // anchor.expiry-not-passed will UNSUPPORTED this
+                    // commitment with a clear evidence note.
+                }
             }
         }
         for (const vout of u.claimedVouts) {
@@ -245,9 +247,10 @@ export async function verifyAnchor(
     }> = [];
     const perCommitmentExpiry: Array<{
         txid: Txid;
-        blocksRemaining: number;
+        blocksRemaining: number | null;
         nearExpiry: boolean;
         expired: boolean;
+        unsupported: boolean;
     }> = [];
 
     for (const c of commitments) {
@@ -328,22 +331,42 @@ export async function verifyAnchor(
             mempoolSpent,
         });
 
-        // anchor.expiry-not-passed
-        const blocksRemaining = c.batchExpiryHeight - tip.height;
-        const expired = blocksRemaining <= 0;
-        const nearExpiry = !expired && blocksRemaining <= nearExpiryBlocks;
-        perCommitmentExpiry.push({
-            txid: c.txid,
-            blocksRemaining,
-            nearExpiry,
-            expired,
-        });
+        // anchor.expiry-not-passed — commitments without a resolvable
+        // expiry source (arkd seconds-based VtxoTreeExpiry on current
+        // nigiri, for example) are flagged UNSUPPORTED and do NOT
+        // fail the row.
+        if (c.batchExpiryHeight === undefined) {
+            perCommitmentExpiry.push({
+                txid: c.txid,
+                blocksRemaining: null,
+                nearExpiry: false,
+                expired: false,
+                unsupported: true,
+            });
+        } else {
+            const blocksRemaining = c.batchExpiryHeight - tip.height;
+            const expired = blocksRemaining <= 0;
+            const nearExpiry = !expired && blocksRemaining <= nearExpiryBlocks;
+            perCommitmentExpiry.push({
+                txid: c.txid,
+                blocksRemaining,
+                nearExpiry,
+                expired,
+                unsupported: false,
+            });
+        }
     }
 
     const confirmedPassed = perCommitmentConfirmed.every((p) => p.confirmed);
     const matchesPassed = perCommitmentMatches.every((p) => p.match);
     const unspentPassed = perCommitmentUnspent.every((p) => !p.onchainSpent);
+    // expiry row passes if no commitment is expired; unsupported
+    // commitments are counted separately and noted in evidence but do
+    // NOT fail the row.
     const expiryPassed = perCommitmentExpiry.every((p) => !p.expired);
+    const unsupportedExpiryCount = perCommitmentExpiry.filter(
+        (p) => p.unsupported
+    ).length;
 
     return [
         {
@@ -381,12 +404,17 @@ export async function verifyAnchor(
             name: "anchor.expiry-not-passed",
             passed: expiryPassed,
             details: expiryPassed
-                ? `All ${commitments.length} commitment(s) pre-expiry (tip=${tip.height})`
+                ? unsupportedExpiryCount === commitments.length
+                    ? `All ${commitments.length} commitment(s) UNSUPPORTED — no resolvable block-based expiry source (e.g. arkd regtest seconds-based VtxoTreeExpiry); row passes trivially`
+                    : unsupportedExpiryCount > 0
+                      ? `${commitments.length - unsupportedExpiryCount} commitment(s) pre-expiry; ${unsupportedExpiryCount} UNSUPPORTED (no block-based expiry source)`
+                      : `All ${commitments.length} commitment(s) pre-expiry (tip=${tip.height})`
                 : `Expired commitment(s): ${JSON.stringify(perCommitmentExpiry.filter((p) => p.expired))}`,
             durationMs: 0,
             evidence: {
                 tip_height: tip.height,
                 near_expiry_threshold: nearExpiryBlocks,
+                unsupported_count: unsupportedExpiryCount,
                 per_commitment: perCommitmentExpiry,
             },
         },

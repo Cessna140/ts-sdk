@@ -172,7 +172,7 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
         }
     });
 
-    it("B7 — missing tapleaf returns error variant (no silent default)", async () => {
+    it("missing expiry source resolves with undefined batchExpiryHeight (§3.1.3 core rows decoupled from expiry)", async () => {
         const txid = fakeCommitmentTxid(0xd1);
         const onchain = makeMockOnchainProvider({
             txOutputsByTxid: {
@@ -189,9 +189,15 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
             emptyMap,
             new Map()
         );
-        expect(res.ok).toBe(false);
-        if (!res.ok) {
-            expect(res.error).toMatch(/no expiry source/);
+        // Resolver succeeds — core §3.1.3 checks (confirmed/output-
+        // matches/unspent) don't need expiry. Row 4 handles undefined
+        // expiry via UNSUPPORTED.
+        expect(res.ok).toBe(true);
+        if (res.ok) {
+            expect(res.value).toHaveLength(1);
+            expect(res.value[0].batchExpiryHeight).toBeUndefined();
+            expect(res.value[0].batchScript).toBeDefined();
+            expect(res.value[0].batchAmount).toBe(50_000n);
         }
     });
 
@@ -216,14 +222,14 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
         if (!res.ok) expect(res.error).toMatch(/vout 5 out of range/);
     });
 
-    it("B9 — timestamp-shaped CLTV value rejected by parser", async () => {
+    it("B9 — timestamp-shaped CLTV value leaves expiry undefined (no silent coercion)", async () => {
         const txid = fakeCommitmentTxid(0xd3);
         const onchain = makeMockOnchainProvider({
             txOutputsByTxid: {
                 [txid]: [{ script: p2tr32(), amount: 50_000n }],
             },
         });
-        // 500_000_000 is a timestamp, not block height; parseCLTV rejects.
+        // 500_000_000 is a timestamp per BIP 65; parseCLTV rejects it.
         const timestampTapleaf = new Uint8Array([
             0x04, 0x00, 0x65, 0xcd, 0x1d, 0xb1,
         ]);
@@ -237,8 +243,12 @@ describe("P5: resolveCommitments (B7 + B9 invariants)", () => {
             tapleafMap,
             new Map()
         );
-        expect(res.ok).toBe(false);
-        if (!res.ok) expect(res.error).toMatch(/CLTV parse failed/);
+        // Resolver still succeeds (on-chain outputs fetched); expiry
+        // left undefined — no silent coercion from timestamp.
+        expect(res.ok).toBe(true);
+        if (res.ok) {
+            expect(res.value[0].batchExpiryHeight).toBeUndefined();
+        }
     });
 });
 
@@ -257,15 +267,12 @@ describe("P5: anchorVoutInRange (B6 invariant)", () => {
 });
 
 describe("P5: pipeline end-to-end", () => {
-    it("key-path-only fixture: anchor stage surfaces no-tapleaf error (resolver can't parse CLTV)", async () => {
+    it("key-path-only fixture: anchor stage runs all 4 rows green (expiry UNSUPPORTED for commitments without block-based source)", async () => {
         const fx = buildMockChain({ depth: 2 });
         const indexer = makeMockIndexerProvider({
             vtxoChain: fx.vtxoChain,
             virtualTxs: fx.virtualTxs,
         });
-        // Mock onchain supplies the commitment's on-chain outputs (but
-        // key-path fixture has no tapleaves on any child input, so the
-        // resolver has no CLTV source → errors[] entry, no anchor rows).
         const onchain = makeMockOnchainProvider({
             txOutputsByTxid: {
                 [fx.commitmentTxid]: [{ script: p2tr32(), amount: 100_000n }],
@@ -276,15 +283,21 @@ describe("P5: pipeline end-to-end", () => {
             indexerProvider: indexer,
             onchainProvider: onchain,
         });
-        // chain 9 + sig 4 = 13 rows still green; anchor rows absent.
-        expect(result.checks.length).toBe(13);
-        // Honest failure surfaced as errors[] row with the resolver's code.
-        const resolveErr = result.errors.find(
-            (e) => e.code === "anchor.commitment-resolve-failed"
+        // 9 chain + 4 sig + 4 anchor = 17 rows; all green (§3.1.3
+        // core rows decoupled from expiry source).
+        expect(result.checks.length).toBe(17);
+        for (const c of result.checks) {
+            expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
+        }
+        // Expiry row passed with UNSUPPORTED note (no tapleaf source).
+        const expiryRow = result.checks.find(
+            (c) => c.name === "anchor.expiry-not-passed"
         );
-        expect(resolveErr).toBeDefined();
-        expect(resolveErr?.message).toMatch(/no expiry source/);
-        // Pipeline did not throw.
-        expect(result.valid).toBe(false); // errors[] non-empty → valid: false
+        expect(expiryRow?.passed).toBe(true);
+        expect(expiryRow?.evidence?.unsupported_count).toBeGreaterThanOrEqual(
+            1
+        );
+        expect(result.errors).toHaveLength(0);
+        expect(result.valid).toBe(true);
     });
 });

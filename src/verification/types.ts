@@ -422,21 +422,24 @@ export interface UnresolvedCommitmentInfo {
 }
 
 /**
- * Fully-resolved commitment metadata. Every field is required and every
- * constructor path enforces the B-invariants: {@link batchAmount} never
- * optional (B4), {@link vout} never defaulting (B7), {@link batchExpiryHeight}
- * only via {@link parseCLTVFromCommitmentScript} (B9).
- *
- * The anchor verifier and exit-bundle builder consume this shape; the
- * chain walker emits {@link UnresolvedCommitmentInfo}; P5 resolves the
- * gap.
+ * Resolved commitment metadata. `batchScript`, `batchAmount`, `vout`
+ * are required (B4 / B7 invariants — no silent defaults). The
+ * `batchExpiryHeight` is **optional** because §3.1.3's core checks
+ * (confirmed / output-matches / unspent) do not depend on it, and
+ * different protocols encode expiry differently (block-based CLTV
+ * tapleaf vs seconds-based relative `VtxoTreeExpiry` PSBT field). When
+ * present it must come from one of the two B9-approved constructors:
+ * {@link parseCLTVFromCommitmentScript} or
+ * {@link blockHeightFromRelativeDelay}. When absent, the anchor
+ * verifier's `anchor.expiry-not-passed` row emits UNSUPPORTED; the
+ * other three anchor rows still run.
  */
 export interface ResolvedCommitmentInfo {
     readonly txid: Txid;
     readonly vout: number;
     readonly batchScript: Uint8Array;
     readonly batchAmount: bigint;
-    readonly batchExpiryHeight: BlockHeight;
+    readonly batchExpiryHeight?: BlockHeight;
 }
 
 /**

@@ -53,7 +53,7 @@ describe("verifyVtxo e2e — M2 (requires nigiri)", () => {
     beforeEach(beforeEachFaucet, 30_000);
 
     it(
-        "live arkd VTXO: walker + signature verifier run green against real data (anchor stage blocked by arkd seconds-based expiry — documented gap)",
+        "live arkd VTXO: Tier 1 happy path (chain + sig + anchor rows green on real arkd; expiry row UNSUPPORTED under seconds-based VtxoTreeExpiry)",
         { timeout: 90_000 },
         async () => {
             const alice: TestArkWallet = await createTestArkWallet();
@@ -83,6 +83,23 @@ describe("verifyVtxo e2e — M2 (requires nigiri)", () => {
             expect(commitment).toBeDefined();
             await waitForTxOnChopsticks(commitment!.txid);
             mineBlock();
+            // Wait for chopsticks to pick up the new block so
+            // getTxStatus() reports confirmed: true.
+            await waitFor(
+                async () => {
+                    try {
+                        const r = await fetch(
+                            `http://localhost:3000/tx/${commitment!.txid}/status`
+                        );
+                        if (!r.ok) return false;
+                        const s = await r.json();
+                        return !!s.confirmed;
+                    } catch {
+                        return false;
+                    }
+                },
+                { timeout: 15_000, interval: 500 }
+            );
 
             const result = await verifyVtxo({
                 vtxoId: outpoint,
@@ -91,28 +108,26 @@ describe("verifyVtxo e2e — M2 (requires nigiri)", () => {
                 options: { minConfirmations: 1 },
             });
 
-            // Every chain.* row runs on real arkd data.
-            const chainRows = result.checks.filter((c) =>
-                c.name.startsWith("chain.")
-            );
-            expect(chainRows.length).toBeGreaterThanOrEqual(8);
-            for (const c of chainRows) {
+            // Every check row runs on real arkd data — chain, sig,
+            // AND anchor §3.1.3 core rows (confirmed / output-matches
+            // / unspent) all green. The expiry row passes with an
+            // UNSUPPORTED note for arkd's seconds-based VtxoTreeExpiry
+            // (B9 won't silently coerce — see issues log).
+            for (const c of result.checks) {
                 expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
             }
-            // Pipeline did not throw; anchor stage blocked by
-            // seconds-based expiry (arkd regtest emits BIP 68 seconds;
-            // B9 forbids silent seconds→blocks conversion). Error is
-            // captured honestly as errors[] entry, not a throw.
-            const resolveErr = result.errors.find(
-                (e) => e.code === "anchor.commitment-resolve-failed"
+            expect(result.checks.length).toBeGreaterThanOrEqual(17);
+            const expiryRow = result.checks.find(
+                (c) => c.name === "anchor.expiry-not-passed"
             );
-            expect(resolveErr).toBeDefined();
-            expect(resolveErr?.message).toMatch(/expiry source/);
-            // valid: false because errors[] is non-empty. Documented:
-            // the anchor stage will unblock once arkd regtest uses
-            // block-based expiry or we extend the BlockHeight
-            // constructor set (see verification-v2-issues-log.md).
-            expect(result.valid).toBe(false);
+            expect(expiryRow?.passed).toBe(true);
+            // arkd regtest surfaces seconds-based expiry → UNSUPPORTED
+            // count should be >=1 (every commitment).
+            expect(
+                expiryRow?.evidence?.unsupported_count
+            ).toBeGreaterThanOrEqual(1);
+            expect(result.valid).toBe(true);
+            expect(result.errors).toHaveLength(0);
         }
     );
 

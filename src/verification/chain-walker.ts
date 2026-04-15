@@ -5,7 +5,7 @@ import { ChainTxType } from "../providers/indexer";
 import type { Outpoint } from "../wallet";
 import { MalformedChainError, ProviderUnavailableError } from "./errors";
 import type { CheckResult, CommitmentInfo, Txid } from "./types";
-import { txidFromString } from "./types";
+import { decodeBip68SequenceBlocks, txidFromString } from "./types";
 
 /**
  * Maximum fee leak across the DAG before `chain.value-conservation` fails.
@@ -46,6 +46,15 @@ export interface ChainWalkerInput {
     readonly indexerProvider: IndexerProvider;
     readonly signal?: AbortSignal;
     readonly feeToleranceSats?: bigint;
+    /**
+     * Expected CSV sweep-delay in blocks declared by the batch output's
+     * VtxoTree. When supplied, {@link chain.checkpoint-csv-coherent}
+     * fails if any CHECKPOINT node's input nSequence decodes to a
+     * different block count. When omitted, the check validates only
+     * that every CHECKPOINT agrees with every other CHECKPOINT
+     * (internal consistency).
+     */
+    readonly expectedCsvBlocks?: number;
 }
 
 /**
@@ -530,6 +539,71 @@ export async function walkChain(
         evidence: {
             scripts_checked: scriptsChecked,
             scripts_failed: scriptsFailed,
+        },
+    });
+
+    // chain.checkpoint-csv-coherent (§3.1.1 sweep-delay coherence, P2).
+    // For every CHECKPOINT node, decode its input 0 nSequence via BIP 68
+    // and confirm every checkpoint agrees on block count. If
+    // `expectedCsvBlocks` is supplied, require agreement with it too.
+    const csvStart = Date.now();
+    const checkpointObservations: Array<{
+        txid: Txid;
+        observedBlocks: number | null;
+    }> = [];
+    for (const node of path) {
+        if (node.type !== ChainTxType.CHECKPOINT) continue;
+        const parsedTx = parsed.get(node.txid);
+        if (!parsedTx) continue;
+        const input = parsedTx.getInput(0);
+        const seq = input?.sequence ?? 0xffffffff;
+        const blocks = decodeBip68SequenceBlocks(seq);
+        checkpointObservations.push({
+            txid: node.txid,
+            observedBlocks: blocks,
+        });
+    }
+    const csvMismatches: string[] = [];
+    let csvPassed = true;
+    const distinctCsvs = new Set(
+        checkpointObservations
+            .map((o) => o.observedBlocks)
+            .filter((v): v is number => v !== null)
+    );
+    if (distinctCsvs.size > 1) {
+        csvPassed = false;
+        csvMismatches.push(
+            `CHECKPOINTs disagree on CSV: observed ${Array.from(distinctCsvs).join(", ")}`
+        );
+    }
+    if (
+        input.expectedCsvBlocks !== undefined &&
+        checkpointObservations.length > 0
+    ) {
+        for (const obs of checkpointObservations) {
+            if (obs.observedBlocks !== input.expectedCsvBlocks) {
+                csvPassed = false;
+                csvMismatches.push(
+                    `${obs.txid} observed ${obs.observedBlocks} blocks, expected ${input.expectedCsvBlocks}`
+                );
+            }
+        }
+    }
+    checks.push({
+        name: "chain.checkpoint-csv-coherent",
+        passed: csvPassed,
+        details:
+            checkpointObservations.length === 0
+                ? "No CHECKPOINT nodes in DAG (trivially coherent)"
+                : csvPassed
+                  ? `${checkpointObservations.length} CHECKPOINT(s) agree on CSV block count`
+                  : csvMismatches.join("; "),
+        durationMs: Date.now() - csvStart,
+        evidence: {
+            checkpoints_checked: checkpointObservations.length,
+            csv_observed: Array.from(distinctCsvs),
+            csv_expected: input.expectedCsvBlocks ?? null,
+            csv_mismatches: csvMismatches,
         },
     });
 

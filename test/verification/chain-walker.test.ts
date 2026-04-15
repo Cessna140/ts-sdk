@@ -31,7 +31,7 @@ describe("chain walker / buildDag", () => {
                 vtxo: fx.leaf,
                 indexerProvider: indexer,
             });
-            expect(out.checks).toHaveLength(6);
+            expect(out.checks).toHaveLength(7);
             for (const c of out.checks) {
                 expect(c.passed, `${c.name}: ${c.details}`).toBe(true);
             }

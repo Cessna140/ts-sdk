@@ -48,21 +48,149 @@ export function txidFromString(hex: string): Txid {
  */
 export type BlockHeight = number & { readonly __brand: "block-height" };
 
+/** Per BIP 65, absolute block-height CLTV values must be < 500_000_000. */
+export const CLTV_HEIGHT_THRESHOLD = 500_000_000;
+
+/** Opcode for OP_CHECKLOCKTIMEVERIFY. */
+const OP_CLTV = 0xb1;
+
+/** Minimum push opcode: anything <= 0x4b is a direct-push length byte. */
+const MAX_DIRECT_PUSH = 0x4b;
+
 /**
- * Parses a CLTV (CHECKLOCKTIMEVERIFY) push value from a commitment tapleaf
- * script and returns it as a BlockHeight. This is the ONLY way to construct
- * a BlockHeight in the verification module. See also {@link chain-walker}
- * where it is used to populate {@link CommitmentInfo.batchExpiryHeight}.
- *
- * @throws {Error} if no CLTV push is found or the pushed value is not a
- *   block-height-shaped CScriptNum.
+ * Parse a single CScriptNum (minimal encoding, 0-8 bytes, little-endian
+ * with a sign bit in the top bit of the final byte) from `bytes` starting
+ * at `offset`. Returns {value, nextOffset}. Used to decode the CLTV push.
  */
-export function parseCLTVFromCommitmentScript(
-    _script: Uint8Array
-): BlockHeight {
-    // Implementation lands in Phase 2 (commit: "checkpoint CSV coherence +
-    // CLTV-direct expiry parsing"). The exported signature is the invariant.
-    throw new Error("parseCLTVFromCommitmentScript: not implemented until P2");
+function readCScriptNum(
+    bytes: Uint8Array,
+    offset: number,
+    len: number
+): number {
+    if (len === 0) return 0;
+    if (len > 8) throw new Error(`CScriptNum oversized: ${len} bytes`);
+    let n = 0n;
+    for (let i = 0; i < len; i++) {
+        n |= BigInt(bytes[offset + i]) << BigInt(8 * i);
+    }
+    // Sign bit in MSB of the last byte.
+    const signBit = 1n << BigInt(8 * len - 1);
+    if (n & signBit) {
+        n = -(n & (signBit - 1n));
+    }
+    if (n < 0n || n > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`CScriptNum out of range: ${n}`);
+    }
+    return Number(n);
+}
+
+/**
+ * Parses a CLTV (CHECKLOCKTIMEVERIFY) push from a commitment tapleaf
+ * script and returns it as a {@link BlockHeight}. The script is expected
+ * to contain the canonical `<locktime> OP_CHECKLOCKTIMEVERIFY` pattern;
+ * we scan for the first OP_CLTV (0xb1) and read its immediate predecessor
+ * push as the locktime.
+ *
+ * This is the ONLY way to construct a BlockHeight in the verification
+ * module. The B9 invariant holds — no ISO timestamp + 600s/block
+ * heuristic path exists.
+ *
+ * @throws {Error} if no CLTV push is found, the push is malformed, or
+ *   the value is not a block-height (values >= 500_000_000 are
+ *   timestamps per BIP 65 and are rejected here).
+ */
+export function parseCLTVFromCommitmentScript(script: Uint8Array): BlockHeight {
+    // Walk the script, tracking the most recent push's value + length.
+    // When we hit OP_CLTV, the preceding push is the locktime.
+    let i = 0;
+    let lastPushValue: number | null = null;
+    while (i < script.length) {
+        const op = script[i];
+        if (op === OP_CLTV) {
+            if (lastPushValue === null) {
+                throw new Error(
+                    "parseCLTVFromCommitmentScript: OP_CLTV with no preceding push"
+                );
+            }
+            if (lastPushValue >= CLTV_HEIGHT_THRESHOLD) {
+                throw new Error(
+                    `parseCLTVFromCommitmentScript: value ${lastPushValue} is a timestamp, not a block height`
+                );
+            }
+            return lastPushValue as BlockHeight;
+        }
+        // OP_0 pushes a 0 value.
+        if (op === 0x00) {
+            lastPushValue = 0;
+            i += 1;
+            continue;
+        }
+        // OP_1..OP_16 push their numeric value (0x51..0x60).
+        if (op >= 0x51 && op <= 0x60) {
+            lastPushValue = op - 0x50;
+            i += 1;
+            continue;
+        }
+        // OP_1NEGATE = 0x4f.
+        if (op === 0x4f) {
+            lastPushValue = -1;
+            i += 1;
+            continue;
+        }
+        // Direct push: 0x01..0x4b push N bytes.
+        if (op >= 0x01 && op <= MAX_DIRECT_PUSH) {
+            const len = op;
+            const v = readCScriptNum(script, i + 1, len);
+            lastPushValue = v;
+            i += 1 + len;
+            continue;
+        }
+        // OP_PUSHDATA1 (0x4c), PUSHDATA2 (0x4d), PUSHDATA4 (0x4e).
+        if (op === 0x4c) {
+            const len = script[i + 1];
+            const v = readCScriptNum(script, i + 2, len);
+            lastPushValue = v;
+            i += 2 + len;
+            continue;
+        }
+        if (op === 0x4d) {
+            const len = script[i + 1] | (script[i + 2] << 8);
+            const v = readCScriptNum(script, i + 3, len);
+            lastPushValue = v;
+            i += 3 + len;
+            continue;
+        }
+        if (op === 0x4e) {
+            const len =
+                script[i + 1] |
+                (script[i + 2] << 8) |
+                (script[i + 3] << 16) |
+                (script[i + 4] << 24);
+            const v = readCScriptNum(script, i + 5, len);
+            lastPushValue = v;
+            i += 5 + len;
+            continue;
+        }
+        // Non-push opcode; clear lastPushValue (the locktime push must be
+        // the IMMEDIATE predecessor of OP_CLTV).
+        lastPushValue = null;
+        i += 1;
+    }
+    throw new Error(
+        "parseCLTVFromCommitmentScript: no OP_CHECKLOCKTIMEVERIFY found"
+    );
+}
+
+/**
+ * Decode a BIP 68 nSequence field into the number of blocks it encodes,
+ * or `null` if the relative-lock bit is disabled (0x80000000 set) or the
+ * type bit (0x400000) signals a time-based lock (we only surface
+ * block-count locks — Ark checkpoints use blocks).
+ */
+export function decodeBip68SequenceBlocks(nSequence: number): number | null {
+    if ((nSequence & 0x80000000) !== 0) return null; // disable bit set
+    if ((nSequence & 0x00400000) !== 0) return null; // type bit = time
+    return nSequence & 0x0000ffff;
 }
 
 /**

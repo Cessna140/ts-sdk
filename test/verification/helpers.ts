@@ -204,6 +204,118 @@ export function buildMockChain(
 }
 
 /**
+ * Build a key-path tx whose input 0 has a specific nSequence value.
+ * Used to synthesise checkpoint fixtures for the CSV-coherence check.
+ */
+export function buildKeyPathTxWithSequence(
+    opts: BuildTxInput & { sequence: number }
+): BuiltTx {
+    const tx = new Transaction({ version: 2, allowUnknownOutputs: true });
+    tx.addInput({
+        txid: opts.parentTxid,
+        index: opts.parentVout,
+        witnessUtxo: { script: opts.parentScript, amount: opts.parentAmount },
+        sequence: opts.sequence,
+    });
+    for (const out of opts.outputs) {
+        tx.addOutput({ script: out.script, amount: out.amount });
+    }
+    const sighash = tx.preimageWitnessV1(
+        0,
+        [opts.parentScript],
+        SigHash.DEFAULT,
+        [opts.parentAmount]
+    );
+    const sig = schnorr.sign(sighash, opts.signingKey);
+    tx.updateInput(0, { tapKeySig: sig });
+    const bytes = tx.toPSBT();
+    return {
+        psbtBase64: base64.encode(bytes),
+        tx: Transaction.fromPSBT(bytes),
+        txid: tx.id,
+    };
+}
+
+/**
+ * Single-root chain with a CHECKPOINT node between the leaf and
+ * commitment. Every CHECKPOINT carries nSequence = `csvBlocks` (BIP 68
+ * relative-lock block-count encoding).
+ *
+ * Layout: commitment ← checkpoint[seq=csvBlocks] ← leaf
+ */
+export function buildCheckpointChain(opts: {
+    csvBlocks: number;
+    /** If set, override only the checkpoint's sequence to this value. */
+    tamperCheckpointSequence?: number;
+}): MockChainFixture {
+    const branchPub = xOnlyPubkey(TEST_KEYS.branchSigner);
+    const batchScript = p2trScript(branchPub);
+    const commitmentTxid = fakeCommitmentTxid(0xc4);
+    const batchAmount = 100_000n;
+    const feePerHop = 500n;
+
+    const checkpointScript = p2trScript(branchPub);
+    const checkpoint = buildKeyPathTxWithSequence({
+        parentTxid: commitmentTxid,
+        parentVout: 0,
+        parentScript: batchScript,
+        parentAmount: batchAmount,
+        signingKey: TEST_KEYS.branchSigner,
+        sequence:
+            opts.tamperCheckpointSequence !== undefined
+                ? opts.tamperCheckpointSequence
+                : opts.csvBlocks,
+        outputs: [
+            {
+                script: checkpointScript,
+                amount: batchAmount - feePerHop,
+            },
+        ],
+    });
+    const leafScript = p2trScript(xOnlyPubkey(TEST_KEYS.leafSigner));
+    const leaf = buildKeyPathTx({
+        parentTxid: checkpoint.txid,
+        parentVout: 0,
+        parentScript: checkpointScript,
+        parentAmount: batchAmount - feePerHop,
+        signingKey: TEST_KEYS.branchSigner,
+        outputs: [
+            {
+                script: leafScript,
+                amount: batchAmount - feePerHop * 2n,
+            },
+        ],
+    });
+    const expiresAt = new Date(Date.now() + 604800000).toISOString();
+    const chain: ChainTx[] = [
+        {
+            txid: leaf.txid,
+            expiresAt,
+            type: ChainTxType.TREE,
+            spends: [checkpoint.txid],
+        },
+        {
+            txid: checkpoint.txid,
+            expiresAt,
+            type: ChainTxType.CHECKPOINT,
+            spends: [commitmentTxid],
+        },
+        {
+            txid: commitmentTxid,
+            expiresAt,
+            type: ChainTxType.COMMITMENT,
+            spends: [],
+        },
+    ];
+    return {
+        leaf: { txid: leaf.txid, vout: 0 },
+        vtxoChain: { chain },
+        virtualTxs: [leaf.psbtBase64, checkpoint.psbtBase64],
+        commitmentTxid,
+    };
+}
+
+/**
  * Multi-root DAG: leaf has 2 inputs, each into a distinct commitment.
  * Mimics the Arkoor multi-root shape (bug B3/B4 target).
  */

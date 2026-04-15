@@ -27,6 +27,21 @@ export function toDisplayTxid(bytes: Uint8Array): Txid {
 }
 
 /**
+ * Construct a Txid from a pre-display-order hex string (e.g. an indexer
+ * response's `ChainTx.txid`). Validates the shape is 64 lowercase hex
+ * characters. This is the second and only other constructor — consumers
+ * cannot assign a raw `string` to a `Txid` variable.
+ */
+export function txidFromString(hex: string): Txid {
+    if (!/^[0-9a-f]{64}$/.test(hex)) {
+        throw new Error(
+            `txidFromString: expected 64 lowercase hex chars, got "${hex}"`
+        );
+    }
+    return hex as Txid;
+}
+
+/**
  * Branded absolute Bitcoin block height. Sole constructor is
  * {@link parseCLTVFromCommitmentScript} — a BlockHeight cannot be produced
  * from an ISO timestamp + 600s/block heuristic (bug B9 from v1 self-review).

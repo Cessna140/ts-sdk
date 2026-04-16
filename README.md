@@ -1218,6 +1218,74 @@ pnpm release:dry-run
 pnpm release:cleanup
 ```
 
+## Client-Side VTXO Verification
+
+The SDK exposes `verifyVtxo()` for independently validating an ASP's
+claims about a VTXO without trusting the indexer. Implements assignment
+§3.1 (chain reconstruction, signatures, on-chain anchoring) and §3.2
+(taproot script trees, timelocks, hash preimages including Boltz VHTLC).
+
+```typescript
+import {
+    verifyVtxo,
+    EsploraProvider,
+    RestIndexerProvider,
+} from "@arkade-os/sdk";
+
+const result = await verifyVtxo({
+    vtxoId: { txid: "...", vout: 0 },
+    indexerProvider: new RestIndexerProvider("http://localhost:7070"),
+    onchainProvider: new EsploraProvider("http://localhost:3000"),
+    options: { tier: "full", verbose: true, minConfirmations: 6 },
+});
+
+if (!result.valid) {
+    for (const c of result.checks.filter((c) => !c.passed)) {
+        console.error(c.name, c.details, c.evidence);
+    }
+    for (const e of result.errors) {
+        console.error(`[${e.kind}] ${e.code}: ${e.message}`);
+    }
+}
+```
+
+### Tiers
+
+- `tier: "chain"` (default) — Tier 1: 9 chain.* + 4 sig.* + 4 anchor.* = 17 rows
+- `tier: "script"` / `tier: "full"` — Tier 1 + 4 script.* + 3 timelock.* + 2 preimage.* = 26 rows
+
+### Partial-failure semantics
+
+`verifyVtxo()` does NOT throw on tamper. Failures land as
+`CheckResult(passed:false)` rows or typed entries in `errors[]`. Only
+genuinely unparseable input or transport failure surfaces a thrown
+`VerificationThrownError` (caught at the pipeline boundary and converted
+to an `errors[]` entry). The intent is an observable trace — the
+tamper-demo CLI and any browser demo need to render every row, not stop
+at the first failure.
+
+### Tamper demo
+
+```bash
+nigiri start --ark
+pnpm tamper-demo            # 4 attacks on a live arkd VTXO
+pnpm tamper-demo --verbose  # full per-row trace per attack
+```
+
+Demonstrates the verifier catching: signature byte flip
+(`sig.schnorr-valid`), parent txid swap (`chain.parent-missing`),
+commitment removed from chain (`chain.missing-input`), and indexer
+unreachable (`indexer.getVtxoChain-failed`).
+
+### Boltz VHTLC
+
+`test/verification/fixtures/boltz-vhtlc.ts` builds a Boltz-shape VHTLC
+contract using the SDK's `VHTLC.Script` class (6-leaf taptree, NUMS
+internal key, OP_HASH160 preimage commitment in the claim leaf).
+`pnpm vitest run test/verification/boltz-vhtlc.test.ts` exercises the
+preimage verifier — addresses §3.2.3's "demonstrate on Boltz"
+requirement without needing a live LN node.
+
 ## License
 
 MIT

@@ -106,19 +106,45 @@ export interface VerifyVtxoInput {
 }
 
 /**
- * Public entry point. Orchestrates the full verification pipeline:
+ * Public entry point — independently validates an ASP's claims about a
+ * VTXO using the supplied indexer + on-chain providers.
  *
- *   Stage 1 — chain walker (P1/P2): emits 8 chain.* checks.
- *   Stage 2 — signatures (P3): 4 sig.* checks using per-input prevouts.
- *   Stage 3 — Tier 2 script / timelock / preimage (P4).
- *   Stage 4 — anchor + commitment resolution (P5).
- *   Stage 5 — finalise: valid = all checks passed && zero errors.
+ * Pipeline stages:
+ *   1. Chain walker — 9 `chain.*` rows (DAG construction, link/index/
+ *      value/script integrity, checkpoint CSV coherence, taptree shape).
+ *   2. Commitment resolver — fetches each commitment's batch output;
+ *      maps `VtxoTreeExpiry` PSBT field (or tapleaf CLTV) to a typed
+ *      `BlockHeight` via one of the two B9-approved constructors.
+ *   3. Signatures — 4 `sig.*` rows over per-input BIP 341 sighashes.
+ *   4. Anchor — 4 `anchor.*` rows (confirmed / output-matches /
+ *      unspent / expiry-not-passed) — §3.1.3 required checks.
+ *   5. Tier 2 (opt-in via `options.tier`) — 4 `script.*` + 3
+ *      `timelock.*` + 2 `preimage.*` rows.
+ *   6. Finalise — `valid = errors.length === 0 && every check passed`.
  *
- * Only Stages 1–2 are implemented at P3. Tier 2 / anchor land at P4 / P5.
+ * Partial-failure discipline: this function does NOT throw on tamper.
+ * Invariant failures land as `CheckResult(passed:false)` rows; transport
+ * / structural errors land as typed `errors[]` entries (caught at the
+ * pipeline boundary via `recordThrown()`). Consumers always receive a
+ * resolved `VerificationResult` with the full observable trace.
  *
- * Never throws for attack-catching reasons — failures land as
- * `CheckResult(passed:false)` or `errors[]` entries. Throws only via the
- * upstream MalformedChainError for genuinely unparseable input.
+ * @example
+ * ```typescript
+ * const result = await verifyVtxo({
+ *     vtxoId: { txid, vout },
+ *     indexerProvider,
+ *     onchainProvider,
+ *     options: { tier: "full" },
+ * });
+ * if (!result.valid) {
+ *     for (const c of result.checks.filter((c) => !c.passed)) {
+ *         console.error(c.name, c.details, c.evidence);
+ *     }
+ *     for (const e of result.errors) {
+ *         console.error(`[${e.kind}] ${e.code}: ${e.message}`);
+ *     }
+ * }
+ * ```
  */
 export async function verifyVtxo(
     input: VerifyVtxoInput

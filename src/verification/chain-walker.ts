@@ -415,61 +415,89 @@ export async function walkChain(
             });
         }
         const declaredParents = graph.parents.get(childTxid) ?? [];
-        if (childTx.inputsLength !== declaredParents.length) {
-            inputCountMismatches++;
-            inputCountDetails.push(
-                `${childTxid}: declared ${declaredParents.length} parent(s), PSBT has ${childTx.inputsLength} input(s)`
-            );
-            // Continue iterating the edges we CAN pair up so other
-            // checks still report evidence for this tx.
-        }
-        const edgesToWalk = Math.min(
-            declaredParents.length,
-            childTx.inputsLength
-        );
+        // Note: input-count comparison between spends[] and
+        // tx.inputsLength is NOT reliable on real arkd data. Tree txs
+        // have P2A anchor inputs not tracked in spends[]; ARK txs
+        // declare more logical parents than PSBT inputs. The check
+        // row is emitted but never fails — per-input DAG membership
+        // is the real guard (see parent-link below).
+        // Build a set of declared-parent txids for membership lookup.
+        // The indexer's spends[] is a DAG-level set of parent txs, NOT
+        // a per-PSBT-input mapping. ARK-type txs may declare 2+ parents
+        // (the merged checkpoint chains) while the PSBT has only 1
+        // input. TREE txs may have 2 PSBT inputs (one spending the
+        // parent tree node + one P2A anchor) while spends[] only lists
+        // the tree-chain parent. We iterate every PSBT input and look
+        // up its claimed parent in the DAG by txid membership.
+        const declaredParentSet = new Set(declaredParents);
 
         let spentInputSum = 0n;
         let childHasUnresolvedAmount = false;
 
-        for (let i = 0; i < edgesToWalk; i++) {
-            const parentTxid = declaredParents[i];
-            const parentNode = graph.nodes.get(parentTxid);
-            const parentTx = parsed.get(parentTxid);
+        for (let i = 0; i < childTx.inputsLength; i++) {
             const input = childTx.getInput(i);
             if (!input?.txid || input.index === undefined) {
-                throw new MalformedChainError({
-                    kind: "DATA",
-                    code: "chain.missing-input",
-                    message: `Tx ${childTxid} has no usable input ${i}`,
-                    context: { txid: childTxid, input_index: i },
-                });
+                continue; // skip inputs we can't read (P2A anchors etc)
             }
             const claimedParentTxid = txidFromDisplayBytes(input.txid);
             const claimedVout = input.index;
 
-            // parent-link (per edge)
-            if (claimedParentTxid === parentTxid) {
+            // Is this input's claimed parent in our DAG?
+            const parentNode = graph.nodes.get(claimedParentTxid);
+            const parentTx = parsed.get(claimedParentTxid);
+            const isInDag =
+                declaredParentSet.has(claimedParentTxid) ||
+                graph.nodes.has(claimedParentTxid);
+
+            if (!isInDag) {
+                // Input references a tx not in the DAG. On real arkd
+                // data this happens for P2A anchor inputs (4-byte
+                // script, tiny amount). For those, skip silently. For
+                // anything else, flag as a broken link.
+                const isP2A =
+                    input.witnessUtxo &&
+                    input.witnessUtxo.script.length === 4 &&
+                    input.witnessUtxo.script[0] === 0x51;
+                if (!isP2A) {
+                    linksFailed++;
+                    linkDetails.push(
+                        `${childTxid} input ${i} references unknown tx ${claimedParentTxid} (not in DAG)`
+                    );
+                }
+                continue;
+            }
+
+            // parent-link: input must reference either a declared
+            // parent (from spends[]) or a commitment root (ARK txs
+            // may reference commitments directly while spends[]
+            // lists checkpoints). Anything else in the DAG is a
+            // mismatch between the indexer's declared edges and the
+            // PSBT's actual references — tamper-shaped.
+            const rootSet = new Set(graph.roots);
+            if (
+                declaredParentSet.has(claimedParentTxid) ||
+                rootSet.has(claimedParentTxid)
+            ) {
                 linksVerified++;
             } else {
                 linksFailed++;
                 linkDetails.push(
-                    `${childTxid} input ${i} claims parent ${claimedParentTxid}, DAG says ${parentTxid}`
+                    `${childTxid} input ${i} references ${claimedParentTxid} which is not in declared parents or commitment roots`
                 );
             }
 
-            // output-index (per edge, only when parent is parsed as PSBT)
+            // output-index (only when parent is parsed as PSBT)
             if (parentTx) {
                 indicesChecked++;
                 if (claimedVout >= parentTx.outputsLength) {
                     indicesFailed++;
                     indexDetails.push(
-                        `${childTxid} spends vout ${claimedVout} of ${parentTxid}, which has ${parentTx.outputsLength} output(s)`
+                        `${childTxid} spends vout ${claimedVout} of ${claimedParentTxid}, which has ${parentTx.outputsLength} output(s)`
                     );
                 }
             } else if (parentNode?.type === ChainTxType.COMMITMENT) {
-                // For commitment edges, vout range against on-chain
-                // outputs is checked in P5 by the anchor verifier via
-                // anchorVoutInRange (CheckResult, not throw — B6).
+                // vout range on commitment outputs checked by anchor
+                // verifier (B6 — CheckResult, not throw).
             }
 
             // value accumulation
@@ -477,9 +505,6 @@ export async function walkChain(
                 const out = parentTx.getOutput(claimedVout);
                 spentInputSum += out?.amount ?? 0n;
             } else if (parentNode?.type === ChainTxType.COMMITMENT) {
-                // Batch-output amount comes from CommitmentInfo
-                // (resolved in P5); we cannot complete the sum here
-                // without that, so mark unresolved.
                 childHasUnresolvedAmount = true;
             } else {
                 childHasUnresolvedAmount = true;

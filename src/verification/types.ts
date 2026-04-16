@@ -71,12 +71,15 @@ export function txidFromInternalBytes(bytes: Uint8Array): Txid {
  * 64 lowercase hex characters.
  */
 export function txidFromString(hex: string): Txid {
-    if (!/^[0-9a-f]{64}$/.test(hex)) {
+    // Indexer's ChainTx.spends[] may include `txid:vout` outpoint
+    // strings on CHECKPOINT entries; strip the `:vout` suffix if present.
+    const bare = hex.includes(":") ? hex.split(":")[0] : hex;
+    if (!/^[0-9a-f]{64}$/.test(bare)) {
         throw new Error(
             `txidFromString: expected 64 lowercase hex chars, got "${hex}"`
         );
     }
-    return hex as Txid;
+    return bare as Txid;
 }
 
 /**

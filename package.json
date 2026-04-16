@@ -94,6 +94,7 @@
         "test": "vitest run",
         "test:master": "ARK_ENV=master vitest run",
         "test:unit": "vitest run --exclude test/e2e",
+        "tamper-demo": "tsx scripts/tamper-demo.ts",
         "test:setup": "node test/setup.mjs",
         "regtest:start": "./regtest/start-env.sh",
         "regtest:stop": "./regtest/stop-env.sh",

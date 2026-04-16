@@ -233,24 +233,40 @@ export async function verifyVtxo(
 
             // Stage 5: Tier 2 — script / timelock / preimage verifiers.
             // Only run when the caller opts in with tier: "script" or "full".
+            // Each Tier 2 verifier wrapped independently — a thrown
+            // UnsupportedFeatureError in one (e.g. unrecognised leaf
+            // version in the script verifier) must not block the
+            // others from emitting their rows.
             if (tier === "script" || tier === "full") {
-                const scriptOut = await verifyScripts({
-                    path: sigPath,
-                    dag: dagAdapter,
-                    signal: input.options?.signal,
-                });
-                checks.push(...scriptOut.checks);
-                for (const e of scriptOut.errors) errors.push(e);
-                const tlChecks = await verifyTimelocks({
-                    path: sigPath,
-                    signal: input.options?.signal,
-                });
-                checks.push(...tlChecks);
-                const piChecks = await verifyPreimages({
-                    path: sigPath,
-                    signal: input.options?.signal,
-                });
-                checks.push(...piChecks);
+                try {
+                    const scriptOut = await verifyScripts({
+                        path: sigPath,
+                        dag: dagAdapter,
+                        signal: input.options?.signal,
+                    });
+                    checks.push(...scriptOut.checks);
+                    for (const e of scriptOut.errors) errors.push(e);
+                } catch (e) {
+                    recordThrown(e, errors);
+                }
+                try {
+                    const tlChecks = await verifyTimelocks({
+                        path: sigPath,
+                        signal: input.options?.signal,
+                    });
+                    checks.push(...tlChecks);
+                } catch (e) {
+                    recordThrown(e, errors);
+                }
+                try {
+                    const piChecks = await verifyPreimages({
+                        path: sigPath,
+                        signal: input.options?.signal,
+                    });
+                    checks.push(...piChecks);
+                } catch (e) {
+                    recordThrown(e, errors);
+                }
             }
         } else {
             errors.push({

@@ -1,5 +1,6 @@
 import { base64 } from "@scure/base";
 import { Transaction } from "@scure/btc-signer/transaction.js";
+import { TapTreeCoder } from "../script/base";
 import type { IndexerProvider, ChainTx } from "../providers/indexer";
 import { ChainTxType } from "../providers/indexer";
 import type { Outpoint } from "../wallet";
@@ -654,29 +655,11 @@ export async function walkChain(
                     continue;
                 }
                 scriptTreeChecked++;
-                // Shape check: the blob is a concatenation of
-                // varint(len)||script||leafVersion entries. Just walk
-                // the frame without hashing.
+                // Shape check via SDK's TapTreeCoder (BIP 371
+                // PSBT_OUT_TAP_TREE format: array of {depth, version,
+                // script}). Failure to decode = malformed blob.
                 try {
-                    let i = 0;
-                    while (i < blob.length) {
-                        const first = blob[i];
-                        let len: number;
-                        let off: number;
-                        if (first < 0xfd) {
-                            len = first;
-                            off = 1;
-                        } else if (first === 0xfd) {
-                            len = blob[i + 1] | (blob[i + 2] << 8);
-                            off = 3;
-                        } else {
-                            throw new Error("unsupported varint");
-                        }
-                        i += off;
-                        if (i + len + 1 > blob.length)
-                            throw new Error("leaf truncated");
-                        i += len + 1;
-                    }
+                    TapTreeCoder.decode(blob);
                 } catch (e) {
                     scriptTreeFailed++;
                     scriptTreeDetails.push(

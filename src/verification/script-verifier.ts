@@ -25,6 +25,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { Transaction } from "@scure/btc-signer/transaction.js";
 import { tapLeafHash } from "@scure/btc-signer/payment.js";
+import { TapTreeCoder } from "../script/base";
 import {
     TAPROOT_UNSPENDABLE_KEY,
     taprootTweakPubkey,
@@ -118,41 +119,20 @@ function keyStartsWith(keyBytes: Uint8Array, prefix: string): boolean {
 }
 
 /**
- * Decode a minimal taptree from the `VtxoTaprootTree` PSBT field.
- * The field carries a concatenation of tapleaf scripts; each entry
- * is `varint(len) || script || leafVersion`. We validate shape and
- * return the leaf hashes for merkle-containment checks.
+ * Decode the `VtxoTaprootTree` PSBT unknown field via the SDK's
+ * `TapTreeCoder` (BIP 371 PSBT_OUT_TAP_TREE format:
+ * array of `{depth: U8, version: U8, script: VarBytes}`). Returns the
+ * leaf-hash array for merkle-containment checks.
  */
 function decodeVtxoTaprootTree(blob: Uint8Array): readonly Uint8Array[] | null {
-    // Minimal permissive decoder — we accept both the arkd on-wire
-    // format and a legacy pre-P4 format that emitted raw script
-    // concatenation. Returns null if the blob is not recognisable.
     if (blob.length === 0) return [];
     try {
-        const leaves: Uint8Array[] = [];
-        let i = 0;
-        while (i < blob.length) {
-            // Read varint length
-            const first = blob[i];
-            let len: number;
-            let off: number;
-            if (first < 0xfd) {
-                len = first;
-                off = 1;
-            } else if (first === 0xfd) {
-                len = blob[i + 1] | (blob[i + 2] << 8);
-                off = 3;
-            } else {
-                return null;
-            }
-            i += off;
-            if (i + len + 1 > blob.length) return null;
-            const script = blob.subarray(i, i + len);
-            const leafVersion = blob[i + len];
-            leaves.push(tapLeafHash(script, leafVersion));
-            i += len + 1;
-        }
-        return leaves;
+        const decoded = TapTreeCoder.decode(blob) as ReadonlyArray<{
+            depth: number;
+            version: number;
+            script: Uint8Array;
+        }>;
+        return decoded.map((leaf) => tapLeafHash(leaf.script, leaf.version));
     } catch {
         return null;
     }
@@ -306,11 +286,16 @@ export async function verifyScripts(
                         break;
                     }
                 }
-                if (ctrl.version !== LEAF_VERSION_TAPSCRIPT) {
+                // Per BIP 341 the control-block first byte packs leaf
+                // version in the high bits + parity in bit 0; @scure
+                // exposes this packed value as ctrl.version. 0xc0 and
+                // 0xc1 are both valid tapscript leaves; mask the
+                // parity bit before comparing.
+                if ((ctrl.version & 0xfe) !== LEAF_VERSION_TAPSCRIPT) {
                     throw new UnsupportedFeatureError({
                         kind: "UNSUPPORTED",
                         code: "script.unsupported-leaf-version",
-                        message: `Tx ${txid} input ${j} leaf[${k}] has leaf version 0x${ctrl.version.toString(16)} (only 0xc0 supported)`,
+                        message: `Tx ${txid} input ${j} leaf[${k}] has leaf version 0x${ctrl.version.toString(16)} (only 0xc0/0xc1 tapscript supported)`,
                         context: {
                             txid,
                             input_index: j,
@@ -322,7 +307,9 @@ export async function verifyScripts(
                 // 2. Compute tapleaf hash from `scriptBytes` (which
                 // carries `script || leafVersion`).
                 const script = scriptBytes.subarray(0, scriptBytes.length - 1);
-                const leafHash = tapLeafHash(script, ctrl.version);
+                // tapLeafHash takes the bare leaf version (parity bit
+                // masked off) per BIP 341.
+                const leafHash = tapLeafHash(script, ctrl.version & 0xfe);
 
                 // 3. Walk merkle path to the root
                 let node = leafHash;

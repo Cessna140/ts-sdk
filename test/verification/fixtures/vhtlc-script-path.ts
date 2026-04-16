@@ -25,6 +25,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { Transaction } from "@scure/btc-signer/transaction.js";
 import { p2tr } from "@scure/btc-signer/payment.js";
 import { TAPROOT_UNSPENDABLE_KEY } from "@scure/btc-signer/utils.js";
+import { TapTreeCoder } from "../../../src/script/base";
 import {
     setArkPsbtField,
     VtxoTaprootTree,
@@ -94,20 +95,15 @@ function buildVhtlcTapleafScript(
 }
 
 /**
- * Encode a single-leaf VtxoTaprootTree blob — concatenation of
- * `varint(len) || script || leafVersion`.
+ * Encode a single-leaf VtxoTaprootTree blob using the SDK's
+ * `TapTreeCoder` (BIP 371 PSBT_OUT_TAP_TREE format: array of
+ * `{depth: U8, version: U8, script: VarBytes}`).
  */
 function encodeSingleLeafTree(
     script: Uint8Array,
     leafVersion: number
 ): Uint8Array {
-    if (script.length >= 0xfd)
-        throw new Error("script too large for this helper");
-    const out = new Uint8Array(1 + script.length + 1);
-    out[0] = script.length;
-    out.set(script, 1);
-    out[1 + script.length] = leafVersion;
-    return out;
+    return TapTreeCoder.encode([{ depth: 1, version: leafVersion, script }]);
 }
 
 export interface VhtlcScriptPathFixtureOptions {

@@ -296,7 +296,11 @@ export async function verifyAnchor(
         let mempoolSpent = false;
         try {
             const outspends = await onchainProvider.getTxOutspends(c.txid);
-            if (c.vout >= outspends.length) {
+            if (!Array.isArray(outspends)) {
+                // Malicious provider returned non-array; treat as spent
+                // to fail-safe rather than silently passing.
+                onchainSpent = true;
+            } else if (c.vout >= outspends.length) {
                 // Out-of-range vout — treat as spent=true to surface the
                 // issue. B6: this is a CheckResult flip, not a throw.
                 onchainSpent = true;

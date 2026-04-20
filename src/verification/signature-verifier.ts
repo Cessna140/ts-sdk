@@ -383,9 +383,10 @@ export async function verifySignatures(
 import { equalBytes } from "@scure/btc-signer/utils.js";
 const bytesEqual = equalBytes;
 
+import { txidFromString } from "./types";
+
 function txidFromTx(tx: Transaction): Txid {
-    // @scure's Transaction.id is a display-order hex string.
-    return tx.id as Txid;
+    return txidFromString(tx.id);
 }
 
 // Re-export types for external consumers via the barrel.

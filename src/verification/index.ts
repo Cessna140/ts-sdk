@@ -422,32 +422,16 @@ function assembleSignaturePath(
                 }
             }
 
-            // All three sources failed — this input may be a P2A
-            // anchor or fee input not tracked in the DAG. Use a
-            // zero-value placeholder so the tx is still verifiable
-            // for its DAG-linked inputs.
-            if (
-                inp?.witnessUtxo === undefined &&
-                inputParentTxid &&
-                !parsedByTxid.has(inputParentTxid) &&
-                !resolvedCommitmentsByVout.has(
-                    `${inputParentTxid}:${claimedVout ?? 0}`
-                )
-            ) {
-                // Non-DAG input — placeholder prevout so
-                // makeSignaturePathEntry's length-check passes.
-                prevouts.push({
-                    script: new Uint8Array(0),
-                    amount: 0n,
-                });
-                continue;
-            }
-
+            // All three sources failed. Never feed fabricated
+            // placeholder prevouts into sighash computation — that
+            // would produce an incorrect sighash and could mask a
+            // forged signature as "failed" rather than "unverifiable".
+            // Skip this tx entirely; record the gap.
             resolvable = false;
             errors.push({
                 kind: "UNSUPPORTED",
                 code: "sig.prevout-unresolvable",
-                message: `Tx ${node.txid} input ${i} — prevout unresolvable`,
+                message: `Tx ${node.txid} input ${i} — prevout unresolvable (no witnessUtxo, no DAG parent, no resolved commitment)`,
                 context: {
                     txid: node.txid,
                     input_index: i,

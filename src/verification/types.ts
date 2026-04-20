@@ -252,10 +252,11 @@ export function parseCLTVFromCommitmentScript(script: Uint8Array): BlockHeight {
         }
         if (op === 0x4e) {
             const len =
-                script[i + 1] |
-                (script[i + 2] << 8) |
-                (script[i + 3] << 16) |
-                (script[i + 4] << 24);
+                (script[i + 1] |
+                    (script[i + 2] << 8) |
+                    (script[i + 3] << 16) |
+                    (script[i + 4] << 24)) >>>
+                0; // unsigned to prevent sign-bit overflow
             const v = readCScriptNum(script, i + 5, len);
             lastPushValue = v;
             i += 5 + len;

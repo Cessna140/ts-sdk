@@ -1,3 +1,4 @@
+import * as bip68 from "bip68";
 import type { Transaction } from "@scure/btc-signer";
 
 /**
@@ -274,14 +275,20 @@ export function parseCLTVFromCommitmentScript(script: Uint8Array): BlockHeight {
 
 /**
  * Decode a BIP 68 nSequence field into the number of blocks it encodes,
- * or `null` if the relative-lock bit is disabled (0x80000000 set) or the
- * type bit (0x400000) signals a time-based lock (we only surface
- * block-count locks — Ark checkpoints use blocks).
+ * or `null` if the relative-lock bit is disabled or the type bit signals
+ * a time-based lock (we only surface block-count locks).
+ *
+ * Uses the `bip68` npm package (same as upstream's `unknownFields.ts`
+ * and `tapscript.ts`) rather than hand-rolling the bit masks.
  */
 export function decodeBip68SequenceBlocks(nSequence: number): number | null {
-    if ((nSequence & 0x80000000) !== 0) return null; // disable bit set
-    if ((nSequence & 0x00400000) !== 0) return null; // type bit = time
-    return nSequence & 0x0000ffff;
+    try {
+        const decoded = bip68.decode(nSequence);
+        if (decoded.blocks !== undefined) return decoded.blocks;
+        return null; // seconds-based or disabled
+    } catch {
+        return null; // bip68 throws on invalid sequences (e.g. disable bit)
+    }
 }
 
 /**

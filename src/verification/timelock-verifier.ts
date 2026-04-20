@@ -15,6 +15,7 @@
  */
 
 import { Script } from "@scure/btc-signer/script.js";
+import { MalformedChainError } from "./errors";
 import type { CheckResult, SignaturePathEntry } from "./types";
 import { decodeBip68SequenceBlocks } from "./types";
 
@@ -94,7 +95,11 @@ export async function verifyTimelocks(
     const maxCsv = input.maxCsvBlocks ?? DEFAULT_MAX_CSV_BLOCKS;
 
     if (signal?.aborted) {
-        throw new Error("timelock verification aborted");
+        throw new MalformedChainError({
+            kind: "UNSUPPORTED",
+            code: "timelock.aborted",
+            message: "Timelock verification aborted",
+        });
     }
 
     let fieldsParsed = 0;

@@ -74,11 +74,8 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
     return a.length - b.length;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-    return true;
-}
+import { equalBytes } from "@scure/btc-signer/utils.js";
+const bytesEqual = equalBytes;
 
 function p2trXOnlyKey(script: Uint8Array): Uint8Array | null {
     if (script.length !== 34 || script[0] !== 0x51 || script[1] !== 0x20) {

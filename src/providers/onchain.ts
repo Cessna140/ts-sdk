@@ -2,10 +2,6 @@ import { hex } from "@scure/base";
 import type { NetworkName } from "../networks";
 import { Coin } from "../wallet";
 
-function hexDecode(s: string): Uint8Array {
-    return hex.decode(s);
-}
-
 /**
  * The default base URLs for esplora API providers.
  */
@@ -217,7 +213,7 @@ export class EsploraProvider implements OnchainProvider {
                 );
             }
             outs.push({
-                script: hexDecode(v.scriptpubkey),
+                script: hex.decode(v.scriptpubkey),
                 amount: BigInt(v.value),
             });
         }

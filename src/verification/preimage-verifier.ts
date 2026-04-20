@@ -137,11 +137,8 @@ function scanScriptForHashCommitments(
     return found;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-    return true;
-}
+import { equalBytes } from "@scure/btc-signer/utils.js";
+const bytesEqual = equalBytes;
 
 export interface PreimageVerifierInput {
     readonly path: readonly SignaturePathEntry[];
@@ -200,7 +197,6 @@ export async function verifyPreimages(
     // would be structurally impossible at this stage, not a tamper
     // signal.
     let matches = 0;
-    const missing: string[] = [];
     const pending: string[] = [];
     const mismatched: string[] = [];
     for (const entry of path) {
@@ -257,7 +253,6 @@ export async function verifyPreimages(
             }
         }
     }
-    void missing;
 
     const checks: CheckResult[] = [];
     checks.push({

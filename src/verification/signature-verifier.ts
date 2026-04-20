@@ -380,11 +380,8 @@ export async function verifySignatures(
     return checks;
 }
 
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-    return true;
-}
+import { equalBytes } from "@scure/btc-signer/utils.js";
+const bytesEqual = equalBytes;
 
 function txidFromTx(tx: Transaction): Txid {
     // @scure's Transaction.id is a display-order hex string.

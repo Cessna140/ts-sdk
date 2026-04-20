@@ -195,9 +195,6 @@ export function extractCommitmentTapleafScripts(
         );
         map.set(edge.commitmentTxid, scriptOnly);
     }
-    // Ensure every commitment has a source — if not, the map stays
-    // missing that key and the resolver surfaces the error.
-    for (const c of commitments) void c; // no-op; doc only
     return map;
 }
 

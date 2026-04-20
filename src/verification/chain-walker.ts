@@ -430,6 +430,7 @@ export async function walkChain(
         // the tree-chain parent. We iterate every PSBT input and look
         // up its claimed parent in the DAG by txid membership.
         const declaredParentSet = new Set(declaredParents);
+        const rootSet = new Set(graph.roots);
 
         let spentInputSum = 0n;
         let childHasUnresolvedAmount = false;
@@ -473,7 +474,6 @@ export async function walkChain(
             // lists checkpoints). Anything else in the DAG is a
             // mismatch between the indexer's declared edges and the
             // PSBT's actual references — tamper-shaped.
-            const rootSet = new Set(graph.roots);
             if (
                 declaredParentSet.has(claimedParentTxid) ||
                 rootSet.has(claimedParentTxid)

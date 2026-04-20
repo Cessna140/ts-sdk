@@ -22,7 +22,6 @@ import { ChainTxType } from "../providers/indexer";
 import type { OnchainProvider } from "../providers/onchain";
 import type { Outpoint } from "../wallet";
 import { Transaction } from "@scure/btc-signer/transaction.js";
-import { base64 } from "@scure/base";
 import { makeDagAdapter, walkChain } from "./chain-walker";
 import type { DagNode } from "./chain-walker";
 import {
@@ -498,10 +497,4 @@ function recordThrown(e: unknown, errors: VerificationError[]): void {
         code: "pipeline.unexpected-throw",
         message: e instanceof Error ? e.message : String(e),
     });
-    // Silence unused-import warnings for error classes we don't narrow
-    // on here (they're still exported from the barrel).
-    void MalformedChainError;
-    void ProviderUnavailableError;
-    void UnsupportedFeatureError;
-    void base64;
 }

@@ -352,7 +352,7 @@ export async function verifySignatures(
         for (const edge of dag.commitmentParentedInputs()) {
             cosignerInputsChecked++;
             // PSBT Cosigner field extraction happens here when we wire
-            // it; for P3 the placeholder reports "no cosigner data" as
+            // it; the placeholder reports "no cosigner data" as
             // a passing observation so the row flips only on real
             // aggregation mismatch once data is present.
             cosignerInputsMatched++;

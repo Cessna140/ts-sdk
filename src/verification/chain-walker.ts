@@ -525,7 +525,7 @@ export async function walkChain(
         } else {
             // Tx has a COMMITMENT-typed parent whose batchAmount hasn't
             // been resolved yet — the check is NOT exercised for this
-            // tx. P5 wires the CommitmentResolver and re-runs value
+            // tx. The resolver wires the CommitmentResolver and re-runs value
             // conservation across the commitment boundary.
             valueSkippedTxs.push(childTxid);
         }
@@ -610,7 +610,7 @@ export async function walkChain(
             // Reviewers can see at a glance which txs bypassed the check
             // because a commitment-amount wasn't available yet. Empty on
             // single-root fully-resolvable DAGs; non-empty on Arkoor /
-            // multi-root DAGs until P5 wires the resolver.
+            // multi-root DAGs until The resolver wires the resolver.
             skipped_tx_ids: valueSkippedTxs,
         },
     });

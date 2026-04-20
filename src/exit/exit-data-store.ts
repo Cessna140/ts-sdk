@@ -18,7 +18,7 @@ export interface ExitDataRepository {
 /**
  * In-memory implementation. Production wallets should use an
  * IndexedDB/SQLite-backed adapter; this ships for unit tests and the
- * P6 live-regtest exit-cycle e2e. Stub — implementation lands in P6.
+ * P6 live-regtest exit-cycle e2e. Stub.
  */
 export class InMemoryExitDataRepository implements ExitDataRepository {
     private store = new Map<string, UnilateralExitBundle>();

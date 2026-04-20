@@ -310,7 +310,7 @@ export async function verifyAnchor(
                     // treat any `spent: true` as onchainSpent here and
                     // leave the `near_spent` warning for the case where
                     // a spender appears in our mempool-watch pipeline
-                    // (P7 scope).
+                    // (future scope).
                     onchainSpent = true;
                 }
             }

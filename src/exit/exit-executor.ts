@@ -27,7 +27,7 @@ export interface ExecuteUnilateralExitInput {
  * with per-step trace + structured errors (mirrors verifier
  * partial-failure discipline).
  *
- * The P0 scaffold throws — consistent with every other stub in the
+ * The scaffold throws — consistent with every other stub in the
  * verification + exit modules — so the "not yet implemented" state is
  * unmistakable. Once P6 lands the real executor, the function returns
  * the typed result without throwing.
@@ -35,5 +35,5 @@ export interface ExecuteUnilateralExitInput {
 export async function executeUnilateralExit(
     _input: ExecuteUnilateralExitInput
 ): Promise<ExitExecutionResult> {
-    throw new Error("executeUnilateralExit: not implemented until P6");
+    throw new Error("executeUnilateralExit: not yet implemented");
 }

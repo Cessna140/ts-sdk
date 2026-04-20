@@ -9,13 +9,13 @@ import type { UnilateralExitBundle } from "./types";
  * bundle builder used a global `max(confirmationHeight) + i` offset that
  * ignored per-path CSV in multi-root bundles.
  *
- * Stub — implementation lands in P6.
+ * Stub.
  */
 export function scheduleFromDag(
     _dag: DagGraph,
     _csvDelays: ReadonlyMap<string, number>
 ): readonly PerPathSchedule[] {
-    throw new Error("scheduleFromDag: not implemented until P6");
+    throw new Error("scheduleFromDag: not yet implemented");
 }
 
 export async function buildExitBundleFromVtxo(
@@ -23,5 +23,5 @@ export async function buildExitBundleFromVtxo(
     _indexerProvider: unknown,
     _onchainProvider: unknown
 ): Promise<UnilateralExitBundle> {
-    throw new Error("buildExitBundleFromVtxo: not implemented until P6");
+    throw new Error("buildExitBundleFromVtxo: not yet implemented");
 }

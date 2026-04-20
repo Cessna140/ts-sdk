@@ -558,3 +558,17 @@ export type {
     ContractRepository,
     MigrationStatus,
 };
+
+// Verification module
+export { verifyVtxo } from "./verification";
+export type {
+    VerifyVtxoInput,
+    VerificationResult,
+    VerificationOptions,
+    CheckResult,
+    VerificationError,
+} from "./verification";
+
+// Exit module
+export { InMemoryExitDataRepository } from "./exit";
+export type { ExitDataRepository, UnilateralExitBundle } from "./exit";

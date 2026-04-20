@@ -57,35 +57,34 @@ export {
     buildDag,
     walkChain,
     makeDagAdapter,
-    type DagGraph,
-    type DagNode,
-    type DagWalkerOutput,
-    type DagAdapter,
     MAX_DAG_NODES,
     DEFAULT_FEE_TOLERANCE_SATS,
 } from "./chain-walker";
-export {
-    verifySignatures,
-    preimageWitnessV1Typed,
-    type SignatureVerifierInput,
-} from "./signature-verifier";
-export {
-    verifyScripts,
-    type ScriptVerifierInput,
-    type ScriptVerifierOutput,
+export type {
+    DagGraph,
+    DagNode,
+    DagWalkerOutput,
+    DagAdapter,
+} from "./chain-walker";
+export { verifySignatures, preimageWitnessV1Typed } from "./signature-verifier";
+export type { SignatureVerifierInput } from "./signature-verifier";
+export { verifyScripts } from "./script-verifier";
+export type {
+    ScriptVerifierInput,
+    ScriptVerifierOutput,
 } from "./script-verifier";
 export {
     verifyTimelocks,
-    type TimelockVerifierInput,
     DEFAULT_MIN_CSV_BLOCKS,
     DEFAULT_MAX_CSV_BLOCKS,
 } from "./timelock-verifier";
+export type { TimelockVerifierInput } from "./timelock-verifier";
 export {
     verifyPreimages,
     decodeWitnessStack,
     MAX_PREIMAGE_CANDIDATES,
-    type PreimageVerifierInput,
 } from "./preimage-verifier";
+export type { PreimageVerifierInput } from "./preimage-verifier";
 export {
     verifyAnchor,
     resolveCommitments,
@@ -93,8 +92,10 @@ export {
     anchorVoutInRange,
     DEFAULT_MIN_CONFIRMATIONS,
     DEFAULT_NEAR_EXPIRY_BLOCKS,
-    type AnchorVerifierInput,
-    type CommitmentTapleafMap,
+} from "./anchor-verifier";
+export type {
+    AnchorVerifierInput,
+    CommitmentTapleafMap,
 } from "./anchor-verifier";
 
 export interface VerifyVtxoInput {
@@ -298,7 +299,7 @@ export async function verifyVtxo(
                 kind: "UNSUPPORTED",
                 code: "sig.no-resolvable-path",
                 message:
-                    "No tx in the DAG has all per-input prevouts resolvable from on-chain data yet (P5 wires commitment resolver)",
+                    "No tx in the DAG has all per-input prevouts resolvable from on-chain data yet (The resolver wires commitment resolver)",
             });
         }
     } catch (e) {

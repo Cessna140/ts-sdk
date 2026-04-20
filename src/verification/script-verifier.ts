@@ -11,9 +11,8 @@
  *
  * Additional §3.2.1 + v2 checks:
  *   - `script.internal-key-is-nums`: for every COMMITMENT-parented
- *     input (via DagAdapter, B3 invariant), the internal key MUST be
- *     BIP 341's NUMS point. v1 checked only the topmost entry; v2
- *     iterates every such input.
+ *     input (via DagAdapter iterator), the internal key MUST be
+ *     BIP 341's NUMS point.
  *   - `script.vtxotaprootree-valid`: if the input carries a
  *     `VtxoTaprootTree` PSBT unknown field, decode it and assert the
  *     executed tapleaf is a leaf of the declared tree.
@@ -356,7 +355,7 @@ export async function verifyScripts(
         }
     }
 
-    // NUMS check (§3.1.2 §3.2.1, B3 invariant) — every
+    // NUMS check (§3.1.2 §3.2.1) — every
     // COMMITMENT-parented input must have the NUMS internal key on its
     // topmost tapLeafScript control block. Iteration via DagAdapter,
     // not path[length-1].

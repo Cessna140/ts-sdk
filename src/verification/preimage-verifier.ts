@@ -6,7 +6,7 @@
  * `OP_HASH160 <20B> OP_EQUAL[VERIFY]`) and, for each commitment, walks
  * the PSBT witness stack for a preimage whose hash matches.
  *
- * Bug B8 closed here: {@link decodeWitnessStack} is the SOLE
+ * {@link decodeWitnessStack} is the SOLE
  * candidate-extraction API and returns `Uint8Array[]` (not raw bytes).
  * A hard cap {@link MAX_PREIMAGE_CANDIDATES} prevents DoS amplification.
  */
@@ -26,7 +26,7 @@ export const MAX_PREIMAGE_CANDIDATES = 64;
  *
  * Returns at most {@link MAX_PREIMAGE_CANDIDATES} elements — an
  * adversarial witness with 10 000 one-byte elements cannot force the
- * downstream hash loop to run unbounded work (bug B8 guard).
+ * downstream hash loop to run unbounded work (DoS guard).
  */
 export function decodeWitnessStack(
     finalScriptWitness: Uint8Array
@@ -205,7 +205,7 @@ export async function verifyPreimages(
         // match each commitment of this tx against any candidate.
         // @scure's PSBT parser surfaces `finalScriptWitness` as an
         // already-decoded Uint8Array[] stack; byte-iteration over a
-        // raw Uint8Array (the v1 B8 bug) is impossible here because
+        // raw Uint8Array (the byte-iteration anti-pattern) is impossible here because
         // the type forces us to iterate elements, not bytes.
         const candidates: Uint8Array[] = [];
         for (let j = 0; j < entry.tx.inputsLength; j++) {

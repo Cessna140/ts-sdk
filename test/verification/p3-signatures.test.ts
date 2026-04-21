@@ -169,3 +169,63 @@ describe("P3: preimageWitnessV1Typed / B5 invariant", () => {
         expect(msg.length).toBe(32);
     });
 });
+
+describe("P3: sig.musig2-aggregate-valid — cosigning scheme", () => {
+    it("aggregated cosigner key matches parent P2TR via BIP 327 KeyAgg + taptree tweak", async () => {
+        const { buildCosignerFixture } = await import(
+            "./fixtures/tree-node-cosigner"
+        );
+        const fx = buildCosignerFixture();
+        const indexer = makeMockIndexerProvider({
+            vtxoChain: fx.vtxoChain,
+            virtualTxs: fx.virtualTxs,
+        });
+        const onchain = (await import("./helpers")).makeMockOnchainProvider({
+            txOutputsByTxid: {
+                [fx.commitmentTxid]: [
+                    {
+                        script: fx.commitmentScript,
+                        amount: fx.commitmentAmount,
+                    },
+                ],
+            },
+            outspendsByTxid: {
+                [fx.commitmentTxid]: [{ spent: false, txid: "" }],
+            },
+        });
+        const result = await (
+            await import("../../src/verification/index")
+        ).verifyVtxo({
+            vtxoId: fx.leaf,
+            indexerProvider: indexer,
+            onchainProvider: onchain,
+        });
+
+        const byName = new Map(result.checks.map((c) => [c.name, c]));
+
+        // Aggregate key check: cosigner fields read, aggregated, tweaked,
+        // and matched against parent P2TR.
+        const agg = byName.get("sig.musig2-aggregate-valid");
+        expect(agg?.passed, `aggregate: ${agg?.details}`).toBe(true);
+        expect(agg?.evidence?.inputs_checked).toBeGreaterThanOrEqual(1);
+        expect(agg?.evidence?.inputs_matched).toBeGreaterThanOrEqual(1);
+        expect(agg?.evidence?.inputs_no_taptree).toBe(0);
+
+        // Sweep leaf identified via CSVMultisigTapscript.decode.
+        expect(agg?.evidence?.sweep_leaves_found).toBeGreaterThanOrEqual(1);
+
+        // VtxoTreeExpiry cross-check: sweep timelock matches expiry field.
+        expect(agg?.evidence?.expiry_cross_checks).toBeGreaterThanOrEqual(1);
+        expect(agg?.evidence?.expiry_matched).toBeGreaterThanOrEqual(1);
+    });
+
+    it("no CosignerPublicKey fields — passes with no-data note", async () => {
+        const fx = buildMockChain({ depth: 1 });
+        const path = pathFromVirtualTxs(fx.virtualTxs);
+        const out = await verifySignatures({ path });
+        const agg = out.find((c) => c.name === "sig.musig2-aggregate-valid");
+        expect(agg?.passed).toBe(true);
+        expect(agg?.evidence?.inputs_checked).toBe(0);
+        expect(agg?.details).toContain("No inputs carry CosignerPublicKey");
+    });
+});

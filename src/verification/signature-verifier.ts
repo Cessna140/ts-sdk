@@ -13,6 +13,15 @@ import type {
 } from "./types";
 import { parseSighashFromSchnorrSig, sighashTypeDefault } from "./types";
 import type { DagAdapter } from "./chain-walker";
+import { aggregateKeys } from "../musig2";
+import {
+    getArkPsbtFields,
+    CosignerPublicKey,
+    VtxoTaprootTree,
+    VtxoTreeExpiry,
+} from "../utils/unknownFields";
+import { TapTreeCoder } from "../script/base";
+import { decodeTapscript, CSVMultisigTapscript } from "../script/tapscript";
 
 /**
  * Typed wrapper for `@scure/btc-signer`'s preimageWitnessV1. The
@@ -64,6 +73,45 @@ interface ClassifiedEntry {
     readonly entry: SignaturePathEntry;
     readonly txid: Txid;
     readonly kinds: readonly ("key" | "script")[];
+}
+
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) {
+        if (a[i] !== b[i]) return a[i] - b[i];
+    }
+    return a.length - b.length;
+}
+
+function tapBranchHash(a: Uint8Array, b: Uint8Array): Uint8Array {
+    const [lo, hi] = compareBytes(a, b) <= 0 ? [a, b] : [b, a];
+    return new Uint8Array(schnorr.utils.taggedHash("TapBranch", lo, hi));
+}
+
+/**
+ * Compute the BIP 341 taptree merkle root from decoded leaves
+ * (BIP 371 `{depth, version, script}[]` format).
+ */
+function tapTreeMerkleRoot(
+    leaves: ReadonlyArray<{
+        depth: number;
+        version: number;
+        script: Uint8Array;
+    }>
+): Uint8Array | null {
+    if (leaves.length === 0) return null;
+    const stack: Array<{ depth: number; hash: Uint8Array }> = [];
+    for (const leaf of leaves) {
+        let hash = tapLeafHash(leaf.script, leaf.version);
+        let depth = leaf.depth;
+        while (stack.length > 0 && stack[stack.length - 1].depth === depth) {
+            const sibling = stack.pop()!;
+            hash = tapBranchHash(sibling.hash, hash);
+            depth--;
+        }
+        stack.push({ depth, hash });
+    }
+    return stack.length === 1 ? stack[0].hash : null;
 }
 
 /**
@@ -338,41 +386,149 @@ export async function verifySignatures(
         },
     });
 
-    // ── 4. MuSig2 aggregate (DAG iterator, B3) ───────────────────────
-    // For every COMMITMENT-parented input, check the Cosigner PSBT
-    // fields (if present) aggregate to the parent P2TR internal key.
-    // Synthetic fixtures do not populate Cosigner fields; the check
-    // passes with an "no-data" note in that case. Real arkd PSBTs
-    // exercise the aggregate path; live nigiri confirms at P7.
+    // ── 4. MuSig2 aggregate — verify cosigning scheme ──────────────
+    // For every input that carries CosignerPublicKey PSBT fields,
+    // aggregate the declared keys (BIP 327 KeyAgg via SDK's
+    // aggregateKeys), tweak with the VtxoTaprootTree merkle root,
+    // and compare the result against the parent P2TR output key.
+    // This replicates the upstream validateVtxoTxGraph check
+    // (src/tree/validation.ts:128-148) on our verified path.
     const aggStart = Date.now();
     let cosignerInputsChecked = 0;
     let cosignerInputsMatched = 0;
+    let cosignerInputsNoTree = 0;
+    let sweepLeavesFound = 0;
+    let expiryCrossChecks = 0;
+    let expiryMatched = 0;
     const cosignerFailDetails: string[] = [];
-    if (dag) {
-        for (const edge of dag.commitmentParentedInputs()) {
+
+    for (const entry of path) {
+        const txid = entry.tx.id as Txid;
+        for (let j = 0; j < entry.tx.inputsLength; j++) {
+            const cosigners = getArkPsbtFields(entry.tx, j, CosignerPublicKey);
+            if (cosigners.length === 0) continue;
             cosignerInputsChecked++;
-            // PSBT Cosigner field extraction happens here when we wire
-            // it; the placeholder reports "no cosigner data" as
-            // a passing observation so the row flips only on real
-            // aggregation mismatch once data is present.
-            cosignerInputsMatched++;
-            edge; // unused until the field reader lands
+
+            const cosignerKeys = cosigners
+                .sort((a, b) => a.index - b.index)
+                .map((c) => c.key);
+
+            if (cosignerKeys.some((k) => k.length !== 33)) {
+                cosignerFailDetails.push(
+                    `${txid} input ${j} invalid cosigner key length`
+                );
+                continue;
+            }
+
+            // Read the taptree to derive the sweep merkle root.
+            const treeBlobs = getArkPsbtFields(entry.tx, j, VtxoTaprootTree);
+            let merkleRoot: Uint8Array | null = null;
+            let sweepTimelock:
+                | { type: "blocks" | "seconds"; value: bigint }
+                | undefined;
+
+            if (treeBlobs.length > 0) {
+                try {
+                    const decoded = TapTreeCoder.decode(
+                        treeBlobs[0]
+                    ) as ReadonlyArray<{
+                        depth: number;
+                        version: number;
+                        script: Uint8Array;
+                    }>;
+                    merkleRoot = tapTreeMerkleRoot(decoded);
+
+                    // Identify the sweep leaf (CSVMultisigTapscript).
+                    for (const leaf of decoded) {
+                        try {
+                            const ts = decodeTapscript(leaf.script);
+                            if (CSVMultisigTapscript.is(ts)) {
+                                sweepTimelock = ts.params.timelock;
+                                sweepLeavesFound++;
+                                break;
+                            }
+                        } catch {
+                            // Not a recognised Ark tapscript — skip.
+                        }
+                    }
+                } catch {
+                    cosignerFailDetails.push(
+                        `${txid} input ${j} VtxoTaprootTree decode failed`
+                    );
+                    continue;
+                }
+            }
+
+            if (!merkleRoot) {
+                cosignerInputsNoTree++;
+                continue;
+            }
+
+            // Aggregate cosigner keys with the taptree tweak and
+            // compare against the parent P2TR output key.
+            try {
+                const { finalKey } = aggregateKeys(cosignerKeys, true, {
+                    taprootTweak: merkleRoot,
+                });
+                const parentXOnly =
+                    entry.perInputPrevouts[j].script.subarray(2);
+                if (parentXOnly.length !== 32) {
+                    cosignerFailDetails.push(
+                        `${txid} input ${j} parent output not P2TR`
+                    );
+                    continue;
+                }
+                if (bytesEqual(finalKey.subarray(1), parentXOnly)) {
+                    cosignerInputsMatched++;
+                } else {
+                    cosignerFailDetails.push(
+                        `${txid} input ${j} aggregated key does not match parent P2TR`
+                    );
+                }
+            } catch (e) {
+                cosignerFailDetails.push(
+                    `${txid} input ${j} key aggregation failed: ${e instanceof Error ? e.message : String(e)}`
+                );
+                continue;
+            }
+
+            // Cross-check sweep timelock against VtxoTreeExpiry.
+            if (sweepTimelock) {
+                const expiries = getArkPsbtFields(entry.tx, j, VtxoTreeExpiry);
+                if (expiries.length > 0) {
+                    expiryCrossChecks++;
+                    const expiry = expiries[0];
+                    if (
+                        expiry.type === sweepTimelock.type &&
+                        expiry.value === sweepTimelock.value
+                    ) {
+                        expiryMatched++;
+                    }
+                }
+            }
         }
     }
+
     const aggPassed = cosignerFailDetails.length === 0;
     checks.push({
         name: "sig.musig2-aggregate-valid",
         passed: aggPassed,
         details:
             cosignerInputsChecked === 0
-                ? "No COMMITMENT-parented inputs in DAG (trivially aggregated)"
-                : cosignerFailDetails.length === 0
-                  ? `${cosignerInputsMatched}/${cosignerInputsChecked} aggregated key(s) match parent P2TR`
-                  : cosignerFailDetails.join("; "),
+                ? "No inputs carry CosignerPublicKey fields"
+                : cosignerFailDetails.length > 0
+                  ? cosignerFailDetails.join("; ")
+                  : cosignerInputsNoTree > 0
+                    ? `${cosignerInputsMatched}/${cosignerInputsChecked} verified; ${cosignerInputsNoTree} skipped (no VtxoTaprootTree)`
+                    : `${cosignerInputsMatched}/${cosignerInputsChecked} aggregated key(s) match parent P2TR`,
         durationMs: Date.now() - aggStart,
         evidence: {
             inputs_checked: cosignerInputsChecked,
             inputs_matched: cosignerInputsMatched,
+            inputs_no_taptree: cosignerInputsNoTree,
+            sweep_leaves_found: sweepLeavesFound,
+            expiry_cross_checks: expiryCrossChecks,
+            expiry_matched: expiryMatched,
             mismatches: cosignerFailDetails,
         },
     });

@@ -183,50 +183,41 @@ export async function verifyScripts(
     const { path, dag, signal } = input;
     throwIfAborted(signal);
 
-    const checks: CheckResult[] = [];
     const errors: VerificationError[] = [];
+    for (const entry of path) {
+        collectUnknownArkFieldErrors(entry.tx, entry.tx.id as Txid, errors);
+    }
 
-    let controlBlocksChecked = 0;
-    let controlBlocksFailed = 0;
-    const controlBlockDetails: string[] = [];
-    let merkleChecked = 0;
-    let merkleMatched = 0;
-    const merkleDetails: string[] = [];
-    let vtreeChecked = 0;
-    let vtreeMatched = 0;
-    const vtreeDetails: string[] = [];
+    const { controlBlock, merkle, vtree } = checkTapLeafScripts(path, errors);
+    const nums = checkNumsInternalKey(path, dag);
+
+    return {
+        checks: [controlBlock, merkle, nums, vtree],
+        errors,
+    };
+}
+
+// ── Tap-leaf script checks ──────────────────────────────────────────
+
+function checkTapLeafScripts(
+    path: readonly SignaturePathEntry[],
+    errors: VerificationError[]
+): {
+    controlBlock: CheckResult;
+    merkle: CheckResult;
+    vtree: CheckResult;
+} {
+    const cb = { checked: 0, failed: 0, details: [] as string[] };
+    const mk = { checked: 0, matched: 0, details: [] as string[] };
+    const vt = { checked: 0, matched: 0, details: [] as string[] };
 
     for (const entry of path) {
         const txid = entry.tx.id as Txid;
-        collectUnknownArkFieldErrors(entry.tx, txid, errors);
-
         for (let j = 0; j < entry.tx.inputsLength; j++) {
-            const inp = entry.tx.getInput(j);
-            const rawTapLeaf = inp.tapLeafScript;
-            if (!Array.isArray(rawTapLeaf) || rawTapLeaf.length === 0) continue;
-            // Validate first entry's shape before trusting the cast.
-            const sample = rawTapLeaf[0];
-            if (
-                !Array.isArray(sample) ||
-                sample.length < 2 ||
-                typeof sample[0]?.version !== "number" ||
-                !(sample[0]?.internalKey instanceof Uint8Array) ||
-                !(sample[1] instanceof Uint8Array)
-            )
-                continue;
-            const tapLeafField = rawTapLeaf as ReadonlyArray<
-                readonly [
-                    {
-                        version: number;
-                        internalKey: Uint8Array;
-                        merklePath: Uint8Array[];
-                    },
-                    Uint8Array,
-                ]
-            >;
+            const tapLeafField = parseTapLeafField(entry.tx.getInput(j));
+            if (!tapLeafField) continue;
 
-            const parentScript = entry.perInputPrevouts[j].script;
-            const parentKey = p2trXOnlyKey(parentScript);
+            const parentKey = p2trXOnlyKey(entry.perInputPrevouts[j].script);
             if (!parentKey) {
                 throw new MalformedChainError({
                     kind: "DATA",
@@ -237,109 +228,214 @@ export async function verifyScripts(
             }
 
             for (let k = 0; k < tapLeafField.length; k++) {
-                const [ctrl, scriptBytes] = tapLeafField[k];
-                controlBlocksChecked++;
+                const leafHash = validateControlBlock(
+                    cb,
+                    tapLeafField[k],
+                    txid,
+                    j,
+                    k
+                );
+                if (!leafHash) continue;
 
-                // 1. Control-block length validation
-                if (
-                    !(ctrl.internalKey instanceof Uint8Array) ||
-                    ctrl.internalKey.length !== 32
-                ) {
-                    controlBlocksFailed++;
-                    controlBlockDetails.push(
-                        `${txid} input ${j} leaf[${k}] internalKey is not 32 bytes`
-                    );
-                    continue;
-                }
-                for (const step of ctrl.merklePath) {
-                    if (!(step instanceof Uint8Array) || step.length !== 32) {
-                        controlBlocksFailed++;
-                        controlBlockDetails.push(
-                            `${txid} input ${j} leaf[${k}] merkle step is not 32 bytes`
-                        );
-                        break;
-                    }
-                }
-                // Per BIP 341 the control-block first byte packs leaf
-                // version in the high bits + parity in bit 0; @scure
-                // exposes this packed value as ctrl.version. 0xc0 and
-                // 0xc1 are both valid tapscript leaves; mask the
-                // parity bit before comparing.
-                if ((ctrl.version & 0xfe) !== LEAF_VERSION_TAPSCRIPT) {
-                    throw new UnsupportedFeatureError({
-                        kind: "UNSUPPORTED",
-                        code: "script.unsupported-leaf-version",
-                        message: `Tx ${txid} input ${j} leaf[${k}] has leaf version 0x${ctrl.version.toString(16)} (only 0xc0/0xc1 tapscript supported)`,
-                        context: {
-                            txid,
-                            input_index: j,
-                            leaf_version: ctrl.version,
-                        },
-                    });
-                }
-
-                // 2. Compute tapleaf hash from `scriptBytes` (which
-                // carries `script || leafVersion`).
-                const script = scriptBytes.subarray(0, scriptBytes.length - 1);
-                // tapLeafHash takes the bare leaf version (parity bit
-                // masked off) per BIP 341.
-                const leafHash = tapLeafHash(script, ctrl.version & 0xfe);
-
-                // 3. Walk merkle path to the root
-                let node = leafHash;
-                for (const step of ctrl.merklePath) {
-                    node = tapBranchHash(node, step);
-                }
-
-                // 4. Tweak the internal key by the computed root
-                const [tweaked] = taprootTweakPubkey(ctrl.internalKey, node);
-
-                merkleChecked++;
-                if (bytesEqual(tweaked, parentKey)) {
-                    merkleMatched++;
-                } else {
-                    merkleDetails.push(
-                        `${txid} input ${j} leaf[${k}] tweaked key != parent P2TR`
-                    );
-                }
-
-                // 5. VtxoTaprootTree containment check — if the PSBT
-                // carries the field, assert this leafHash is a leaf
-                // of the declared tree.
-                const vtreeBlob = extractVtxoTaprootTreeBlob(entry.tx, j);
-                if (vtreeBlob !== null) {
-                    vtreeChecked++;
-                    const declared = decodeVtxoTaprootTree(vtreeBlob);
-                    if (declared === null) {
-                        errors.push({
-                            kind: "DATA",
-                            code: "script.vtxotaprootree-decode",
-                            message: `Tx ${txid} input ${j} VtxoTaprootTree field is malformed`,
-                            context: { txid, input_index: j },
-                        });
-                    } else {
-                        const contained = declared.some((h) =>
-                            bytesEqual(h, leafHash)
-                        );
-                        if (contained) vtreeMatched++;
-                        else {
-                            vtreeDetails.push(
-                                `${txid} input ${j} leaf[${k}] not a leaf of declared VtxoTaprootTree`
-                            );
-                        }
-                    }
-                }
+                verifyMerkleRoot(
+                    mk,
+                    leafHash,
+                    tapLeafField[k],
+                    parentKey,
+                    txid,
+                    j,
+                    k
+                );
+                verifyVtxoTreeContainment(
+                    vt,
+                    leafHash,
+                    entry.tx,
+                    j,
+                    txid,
+                    k,
+                    errors
+                );
             }
         }
     }
 
-    // NUMS check (§3.1.2 §3.2.1) — every
-    // COMMITMENT-parented input must have the NUMS internal key on its
-    // topmost tapLeafScript control block. Iteration via DagAdapter,
-    // not path[length-1].
-    let numsChecked = 0;
-    let numsMatched = 0;
-    const numsDetails: string[] = [];
+    return {
+        controlBlock: {
+            name: "script.control-block-valid",
+            passed: cb.failed === 0,
+            details:
+                cb.failed === 0
+                    ? `${cb.checked} control block(s) well-formed`
+                    : cb.details.join("; "),
+            durationMs: 0,
+            evidence: {
+                control_blocks_checked: cb.checked,
+                control_blocks_failed: cb.failed,
+            },
+        },
+        merkle: {
+            name: "script.merkle-root-matches",
+            passed: mk.checked === mk.matched,
+            details:
+                mk.checked === mk.matched
+                    ? `${mk.matched}/${mk.checked} tweaked-key reconstructions match parent P2TR`
+                    : mk.details.join("; "),
+            durationMs: 0,
+            evidence: {
+                merkle_checks: mk.checked,
+                merkle_matched: mk.matched,
+            },
+        },
+        vtree: {
+            name: "script.vtxotaprootree-valid",
+            passed: vt.checked === vt.matched,
+            details:
+                vt.checked === 0
+                    ? "No inputs carry a VtxoTaprootTree field (trivially valid)"
+                    : vt.checked === vt.matched
+                      ? `${vt.matched}/${vt.checked} executed tapleaves are declared-tree members`
+                      : vt.details.join("; "),
+            durationMs: 0,
+            evidence: {
+                vtxotree_checks: vt.checked,
+                vtxotree_matched: vt.matched,
+            },
+        },
+    };
+}
+
+type TapLeafEntry = readonly [
+    {
+        version: number;
+        internalKey: Uint8Array;
+        merklePath: Uint8Array[];
+    },
+    Uint8Array,
+];
+
+function parseTapLeafField(
+    inp: ReturnType<Transaction["getInput"]>
+): ReadonlyArray<TapLeafEntry> | null {
+    const raw = inp.tapLeafScript;
+    if (!Array.isArray(raw) || raw.length === 0) return null;
+    const sample = raw[0];
+    if (
+        !Array.isArray(sample) ||
+        sample.length < 2 ||
+        typeof sample[0]?.version !== "number" ||
+        !(sample[0]?.internalKey instanceof Uint8Array) ||
+        !(sample[1] instanceof Uint8Array)
+    )
+        return null;
+    return raw as ReadonlyArray<TapLeafEntry>;
+}
+
+function validateControlBlock(
+    cb: { checked: number; failed: number; details: string[] },
+    leaf: TapLeafEntry,
+    txid: Txid,
+    j: number,
+    k: number
+): Uint8Array | null {
+    const [ctrl, scriptBytes] = leaf;
+    cb.checked++;
+
+    if (
+        !(ctrl.internalKey instanceof Uint8Array) ||
+        ctrl.internalKey.length !== 32
+    ) {
+        cb.failed++;
+        cb.details.push(
+            `${txid} input ${j} leaf[${k}] internalKey is not 32 bytes`
+        );
+        return null;
+    }
+    for (const step of ctrl.merklePath) {
+        if (!(step instanceof Uint8Array) || step.length !== 32) {
+            cb.failed++;
+            cb.details.push(
+                `${txid} input ${j} leaf[${k}] merkle step is not 32 bytes`
+            );
+            return null;
+        }
+    }
+    if ((ctrl.version & 0xfe) !== LEAF_VERSION_TAPSCRIPT) {
+        throw new UnsupportedFeatureError({
+            kind: "UNSUPPORTED",
+            code: "script.unsupported-leaf-version",
+            message: `Tx ${txid} input ${j} leaf[${k}] has leaf version 0x${ctrl.version.toString(16)}`,
+            context: { txid, input_index: j, leaf_version: ctrl.version },
+        });
+    }
+
+    const script = scriptBytes.subarray(0, scriptBytes.length - 1);
+    return tapLeafHash(script, ctrl.version & 0xfe);
+}
+
+function verifyMerkleRoot(
+    mk: { checked: number; matched: number; details: string[] },
+    leafHash: Uint8Array,
+    leaf: TapLeafEntry,
+    parentKey: Uint8Array,
+    txid: Txid,
+    j: number,
+    k: number
+): void {
+    const [ctrl] = leaf;
+    let node = leafHash;
+    for (const step of ctrl.merklePath) {
+        node = tapBranchHash(node, step);
+    }
+    const [tweaked] = taprootTweakPubkey(ctrl.internalKey, node);
+    mk.checked++;
+    if (bytesEqual(tweaked, parentKey)) {
+        mk.matched++;
+    } else {
+        mk.details.push(
+            `${txid} input ${j} leaf[${k}] tweaked key != parent P2TR`
+        );
+    }
+}
+
+function verifyVtxoTreeContainment(
+    vt: { checked: number; matched: number; details: string[] },
+    leafHash: Uint8Array,
+    tx: Transaction,
+    j: number,
+    txid: Txid,
+    k: number,
+    errors: VerificationError[]
+): void {
+    const vtreeBlob = extractVtxoTaprootTreeBlob(tx, j);
+    if (vtreeBlob === null) return;
+    vt.checked++;
+    const declared = decodeVtxoTaprootTree(vtreeBlob);
+    if (declared === null) {
+        errors.push({
+            kind: "DATA",
+            code: "script.vtxotaprootree-decode",
+            message: `Tx ${txid} input ${j} VtxoTaprootTree field is malformed`,
+            context: { txid, input_index: j },
+        });
+    } else if (declared.some((h) => bytesEqual(h, leafHash))) {
+        vt.matched++;
+    } else {
+        vt.details.push(
+            `${txid} input ${j} leaf[${k}] not a leaf of declared VtxoTaprootTree`
+        );
+    }
+}
+
+// ── NUMS internal-key check ─────────────────────────────────────────
+
+function checkNumsInternalKey(
+    path: readonly SignaturePathEntry[],
+    dag?: DagAdapter
+): CheckResult {
+    let checked = 0;
+    let matched = 0;
+    const details: string[] = [];
+
     if (dag) {
         const byTxid = new Map<Txid, SignaturePathEntry>();
         for (const e of path) byTxid.set(e.tx.id as Txid, e);
@@ -347,91 +443,41 @@ export async function verifyScripts(
             const entry = byTxid.get(edge.childTxid);
             if (!entry) continue;
             const inp = entry.tx.getInput(edge.inputIndex);
-            const rawTapLeafNums = inp.tapLeafScript;
-            if (!Array.isArray(rawTapLeafNums) || rawTapLeafNums.length === 0) {
-                // Key-path commitment input has no tapleaf; NUMS is
-                // enforced implicitly by the MuSig2 aggregate tweak —
-                // skip here (exercised by sig.musig2-aggregate-valid).
-                continue;
-            }
-            const firstEntry = rawTapLeafNums[0];
+            const rawTapLeaf = inp.tapLeafScript;
+            if (!Array.isArray(rawTapLeaf) || rawTapLeaf.length === 0) continue;
+            const first = rawTapLeaf[0];
             if (
-                !Array.isArray(firstEntry) ||
-                !(firstEntry[0]?.internalKey instanceof Uint8Array)
-            ) {
+                !Array.isArray(first) ||
+                !(first[0]?.internalKey instanceof Uint8Array)
+            )
                 continue;
-            }
-            numsChecked++;
-            const internalKey = firstEntry[0].internalKey as Uint8Array;
-            if (bytesEqual(internalKey, TAPROOT_UNSPENDABLE_KEY)) {
-                numsMatched++;
+            checked++;
+            if (bytesEqual(first[0].internalKey, TAPROOT_UNSPENDABLE_KEY)) {
+                matched++;
             } else {
-                numsDetails.push(
+                details.push(
                     `${edge.childTxid} input ${edge.inputIndex} parent is COMMITMENT but internal key != NUMS`
                 );
             }
         }
     }
 
-    checks.push({
-        name: "script.control-block-valid",
-        passed: controlBlocksFailed === 0,
-        details:
-            controlBlocksFailed === 0
-                ? `${controlBlocksChecked} control block(s) well-formed`
-                : controlBlockDetails.join("; "),
-        durationMs: 0,
-        evidence: {
-            control_blocks_checked: controlBlocksChecked,
-            control_blocks_failed: controlBlocksFailed,
-        },
-    });
-    checks.push({
-        name: "script.merkle-root-matches",
-        passed: merkleChecked === merkleMatched,
-        details:
-            merkleChecked === merkleMatched
-                ? `${merkleMatched}/${merkleChecked} tweaked-key reconstructions match parent P2TR`
-                : merkleDetails.join("; "),
-        durationMs: 0,
-        evidence: {
-            merkle_checks: merkleChecked,
-            merkle_matched: merkleMatched,
-        },
-    });
-    checks.push({
+    return {
         name: "script.internal-key-is-nums",
-        passed: numsChecked === numsMatched,
+        passed: checked === matched,
         details:
-            numsChecked === 0
+            checked === 0
                 ? "No script-path COMMITMENT-parented inputs (key-path spends use MuSig2; see sig.musig2-aggregate-valid)"
-                : numsChecked === numsMatched
-                  ? `${numsMatched}/${numsChecked} COMMITMENT-parented input(s) use NUMS internal key`
-                  : numsDetails.join("; "),
+                : checked === matched
+                  ? `${matched}/${checked} COMMITMENT-parented input(s) use NUMS internal key`
+                  : details.join("; "),
         durationMs: 0,
         evidence: {
-            inputs_checked: numsChecked,
-            inputs_matched: numsMatched,
+            inputs_checked: checked,
+            inputs_matched: matched,
             nums_expected_hex: Array.from(TAPROOT_UNSPENDABLE_KEY)
                 .map((b) => b.toString(16).padStart(2, "0"))
                 .join(""),
         },
-    });
-    checks.push({
-        name: "script.vtxotaprootree-valid",
-        passed: vtreeChecked === vtreeMatched,
-        details:
-            vtreeChecked === 0
-                ? "No inputs carry a VtxoTaprootTree field (trivially valid)"
-                : vtreeChecked === vtreeMatched
-                  ? `${vtreeMatched}/${vtreeChecked} executed tapleaves are declared-tree members`
-                  : vtreeDetails.join("; "),
-        durationMs: 0,
-        evidence: {
-            vtxotree_checks: vtreeChecked,
-            vtxotree_matched: vtreeMatched,
-        },
-    });
-
-    return { checks, errors };
+    };
 }

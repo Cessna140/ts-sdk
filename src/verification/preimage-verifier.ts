@@ -150,17 +150,65 @@ export async function verifyPreimages(
     const { path, signal } = input;
     throwIfAborted(signal);
 
+    const scan = scanHashCommitments(path);
+    const match = matchPreimages(scan.commitments, path);
+
+    return [
+        {
+            name: "preimage.conditions-scanned",
+            passed: true,
+            details:
+                scan.commitments.length === 0
+                    ? `Scanned ${scan.scriptsScanned} tapleaf script(s); no hash commitments found`
+                    : `Scanned ${scan.scriptsScanned} script(s); found ${scan.commitments.length} commitment(s) (${scan.sha256Count} sha256, ${scan.hash160Count} hash160)`,
+            durationMs: 0,
+            evidence: {
+                scripts_scanned: scan.scriptsScanned,
+                commitments_found: scan.commitments.length,
+                sha256_commitments: scan.sha256Count,
+                hash160_commitments: scan.hash160Count,
+            },
+        },
+        {
+            name: "preimage.hashes-match",
+            passed: match.mismatched.length === 0,
+            details:
+                scan.commitments.length === 0
+                    ? "No hash commitments to verify"
+                    : match.mismatched.length > 0
+                      ? `${match.mismatched.length} mismatched: ${match.mismatched.join("; ")}`
+                      : match.pending.length > 0
+                        ? `${match.matched} matched; ${match.pending.length} pending finalization (no witness yet — normal for pre-signed txs)`
+                        : `All ${match.matched} hash commitment(s) matched by a witness preimage`,
+            durationMs: 0,
+            evidence: {
+                preimages_matched: match.matched,
+                preimages_pending: match.pending.length,
+                preimages_mismatched: match.mismatched.length,
+                candidates_extracted: match.candidatesExtracted,
+                max_candidates_per_tx: MAX_PREIMAGE_CANDIDATES,
+            },
+        },
+    ];
+}
+
+// ── Phase 1: Scan tapleaf scripts for hash commitments ──────────────
+
+function scanHashCommitments(path: readonly SignaturePathEntry[]): {
+    commitments: HashCommitment[];
+    scriptsScanned: number;
+    sha256Count: number;
+    hash160Count: number;
+} {
     let scriptsScanned = 0;
-    const commitments: HashCommitment[] = [];
     let sha256Count = 0;
     let hash160Count = 0;
-    let candidatesExtracted = 0;
+    const commitments: HashCommitment[] = [];
 
     for (const entry of path) {
         const txid = entry.tx.id as Txid;
         for (let j = 0; j < entry.tx.inputsLength; j++) {
-            const inp = entry.tx.getInput(j);
-            const rawLeaves = inp.tapLeafScript;
+            const rawLeaves = entry.tx.getInput(j).tapLeafScript;
             if (!Array.isArray(rawLeaves) || rawLeaves.length === 0) continue;
             for (const leaf of rawLeaves as ReadonlyArray<
                 readonly [unknown, Uint8Array]
@@ -172,14 +220,12 @@ export async function verifyPreimages(
                 )
                     continue;
                 scriptsScanned++;
-                // leaf[1] = script || leafVersion byte
                 const scriptBytes = leaf[1].subarray(0, leaf[1].length - 1);
-                const found = scanScriptForHashCommitments(
+                for (const c of scanScriptForHashCommitments(
                     scriptBytes,
                     txid,
                     j
-                );
-                for (const c of found) {
+                )) {
                     commitments.push(c);
                     if (c.kind === "sha256") sha256Count++;
                     else hash160Count++;
@@ -188,95 +234,47 @@ export async function verifyPreimages(
         }
     }
 
-    // Per-tx preimage candidate extraction + match. Pre-signed Ark txs
-    // do not carry finalScriptWitness until exit time (BIP 174 finalize
-    // happens at broadcast, not pre-sign). When commitments exist but
-    // no witness stack is present on the spending input, the check
-    // reports "pending finalization" rather than flipping — matching
-    // would be structurally impossible at this stage, not a tamper
-    // signal.
-    let matches = 0;
+    return { commitments, scriptsScanned, sha256Count, hash160Count };
+}
+
+// ── Phase 2: Match witness candidates against commitments ───────────
+
+function matchPreimages(
+    commitments: readonly HashCommitment[],
+    path: readonly SignaturePathEntry[]
+): {
+    matched: number;
+    pending: string[];
+    mismatched: string[];
+    candidatesExtracted: number;
+} {
+    let matched = 0;
+    let candidatesExtracted = 0;
     const pending: string[] = [];
     const mismatched: string[] = [];
+
     for (const entry of path) {
         const txid = entry.tx.id as Txid;
-        // Collect all candidates across every input of this tx, then
-        // match each commitment of this tx against any candidate.
-        // @scure's PSBT parser surfaces `finalScriptWitness` as an
-        // already-decoded Uint8Array[] stack; byte-iteration over a
-        // raw Uint8Array (the byte-iteration anti-pattern) is impossible here because
-        // the type forces us to iterate elements, not bytes.
-        const candidates: Uint8Array[] = [];
-        for (let j = 0; j < entry.tx.inputsLength; j++) {
-            const inp = entry.tx.getInput(j);
-
-            // Source 1: finalScriptWitness (post-finalization witness stack).
-            const stack = inp.finalScriptWitness as
-                | ReadonlyArray<Uint8Array>
-                | undefined;
-            if (stack) {
-                for (const el of stack) {
-                    if (candidates.length >= MAX_PREIMAGE_CANDIDATES) break;
-                    candidates.push(el);
-                }
-            }
-
-            // Source 2: ConditionWitness Ark PSBT field (pre-finalization).
-            // For VHTLC claim paths, the SDK stores the preimage in
-            // this field during intent construction. Pre-signed txs
-            // don't carry finalScriptWitness (BIP 174 finalization
-            // happens at broadcast), so this is the primary preimage
-            // source for presigned Ark transactions.
-            const unknownFields = inp.unknown as
-                | NonNullable<typeof inp.unknown>
-                | undefined;
-            if (unknownFields) {
-                for (const pair of unknownFields) {
-                    try {
-                        const decoded = ConditionWitness.decode(pair);
-                        if (!decoded) continue;
-                        for (const element of decoded) {
-                            if (candidates.length >= MAX_PREIMAGE_CANDIDATES)
-                                break;
-                            candidates.push(element);
-                        }
-                    } catch {
-                        // Not a ConditionWitness field — skip silently.
-                        // Other Ark PSBT fields (VtxoTaprootTree, Cosigner,
-                        // VtxoTreeExpiry) will fail to decode as
-                        // ConditionWitness; this is expected.
-                    }
-                }
-            }
-        }
+        const candidates = extractCandidates(entry.tx);
         candidatesExtracted += candidates.length;
 
         const commitmentsForTx = commitments.filter((c) => c.txid === txid);
-        const txHasWitness = candidates.length > 0;
         for (const commit of commitmentsForTx) {
-            if (!txHasWitness) {
-                // Pre-sign state: no witness to check against. This is
-                // the expected condition for unbroadcasted Ark txs —
-                // recorded as UNSUPPORTED-pending, not a match failure.
+            if (candidates.length === 0) {
                 pending.push(
                     `${commit.txid} input ${commit.inputIndex} ${commit.kind} commitment pending finalization (no witness stack yet)`
                 );
                 continue;
             }
-            let matched = false;
-            for (const cand of candidates) {
+            const found = candidates.some((cand) => {
                 const h =
                     commit.kind === "sha256"
                         ? sha256(cand)
                         : ripemd160(sha256(cand));
-                if (bytesEqual(h, commit.digest)) {
-                    matched = true;
-                    break;
-                }
-            }
-            if (matched) matches++;
+                return bytesEqual(h, commit.digest);
+            });
+            if (found) matched++;
             else {
-                // Witness present but no match — genuine tamper signal.
                 mismatched.push(
                     `${commit.txid} input ${commit.inputIndex} ${commit.kind} commitment has witness but no matching preimage`
                 );
@@ -284,44 +282,44 @@ export async function verifyPreimages(
         }
     }
 
-    const checks: CheckResult[] = [];
-    checks.push({
-        name: "preimage.conditions-scanned",
-        passed: true,
-        details:
-            commitments.length === 0
-                ? `Scanned ${scriptsScanned} tapleaf script(s); no hash commitments found`
-                : `Scanned ${scriptsScanned} script(s); found ${commitments.length} commitment(s) (${sha256Count} sha256, ${hash160Count} hash160)`,
-        durationMs: 0,
-        evidence: {
-            scripts_scanned: scriptsScanned,
-            commitments_found: commitments.length,
-            sha256_commitments: sha256Count,
-            hash160_commitments: hash160Count,
-        },
-    });
-    // Only mismatched (witness-present + no-match) is a real failure.
-    // Pending (no-witness-yet) is pre-signed state, not tamper.
-    const matchesPassed = mismatched.length === 0;
-    checks.push({
-        name: "preimage.hashes-match",
-        passed: matchesPassed,
-        details:
-            commitments.length === 0
-                ? "No hash commitments to verify"
-                : matchesPassed
-                  ? pending.length > 0
-                      ? `${matches} matched; ${pending.length} pending finalization (no witness yet — normal for pre-signed txs)`
-                      : `All ${matches} hash commitment(s) matched by a witness preimage`
-                  : `${mismatched.length} mismatched: ${mismatched.join("; ")}`,
-        durationMs: 0,
-        evidence: {
-            preimages_matched: matches,
-            preimages_pending: pending.length,
-            preimages_mismatched: mismatched.length,
-            candidates_extracted: candidatesExtracted,
-            max_candidates_per_tx: MAX_PREIMAGE_CANDIDATES,
-        },
-    });
-    return checks;
+    return { matched, pending, mismatched, candidatesExtracted };
+}
+
+function extractCandidates(tx: Transaction): Uint8Array[] {
+    const candidates: Uint8Array[] = [];
+    for (let j = 0; j < tx.inputsLength; j++) {
+        const inp = tx.getInput(j);
+
+        // Source 1: finalScriptWitness (post-finalization).
+        const stack = inp.finalScriptWitness as
+            | ReadonlyArray<Uint8Array>
+            | undefined;
+        if (stack) {
+            for (const el of stack) {
+                if (candidates.length >= MAX_PREIMAGE_CANDIDATES) break;
+                candidates.push(el);
+            }
+        }
+
+        // Source 2: ConditionWitness Ark PSBT field (pre-finalization).
+        const unknownFields = inp.unknown as
+            | NonNullable<typeof inp.unknown>
+            | undefined;
+        if (unknownFields) {
+            for (const pair of unknownFields) {
+                try {
+                    const decoded = ConditionWitness.decode(pair);
+                    if (!decoded) continue;
+                    for (const element of decoded) {
+                        if (candidates.length >= MAX_PREIMAGE_CANDIDATES) break;
+                        candidates.push(element);
+                    }
+                } catch {
+                    // Not a ConditionWitness field — expected for other
+                    // Ark PSBT fields.
+                }
+            }
+        }
+    }
+    return candidates;
 }

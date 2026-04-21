@@ -214,7 +214,6 @@ export async function verifyAnchor(
 
     throwIfAborted(signal);
 
-    // Fetch the chain tip once; every check needs it.
     let tip: { height: number; time: number; hash: string };
     try {
         tip = await onchainProvider.getChainTip();
@@ -226,24 +225,19 @@ export async function verifyAnchor(
         });
     }
 
-    // Per-commitment evidence, aggregated.
-    const perCommitmentConfirmed: Array<{
+    const confirmed: Array<{
         txid: Txid;
         confirmed: boolean;
         depth: number | null;
     }> = [];
-    const perCommitmentMatches: Array<{
-        txid: Txid;
-        vout: number;
-        match: boolean;
-    }> = [];
-    const perCommitmentUnspent: Array<{
+    const matches: Array<{ txid: Txid; vout: number; match: boolean }> = [];
+    const unspent: Array<{
         txid: Txid;
         vout: number;
         onchainSpent: boolean;
         mempoolSpent: boolean;
     }> = [];
-    const perCommitmentExpiry: Array<{
+    const expiry: Array<{
         txid: Txid;
         blocksRemaining: number | null;
         nearExpiry: boolean;
@@ -253,171 +247,197 @@ export async function verifyAnchor(
 
     for (const c of commitments) {
         throwIfAborted(signal);
-
-        // anchor.commitment-confirmed
-        let confirmed = false;
-        let depth: number | null = null;
-        try {
-            const status = await onchainProvider.getTxStatus(c.txid);
-            if (status.confirmed) {
-                depth = tip.height - status.blockHeight + 1;
-                confirmed = depth >= minConf;
-            }
-        } catch (e) {
-            throw new ProviderUnavailableError({
-                kind: "NETWORK",
-                code: "onchain.getTxStatus-failed",
-                message: `getTxStatus(${c.txid}) failed: ${e instanceof Error ? e.message : String(e)}`,
-            });
-        }
-        perCommitmentConfirmed.push({ txid: c.txid, confirmed, depth });
-
-        // anchor.output-matches — byte-compare on-chain vs claim.
-        // Resolver already fetched outputs; re-fetch would be wasteful.
-        // Since resolver built `batchScript`/`batchAmount` FROM the
-        // on-chain output, they always match by construction. The real
-        // tamper check here compares against what the walker claimed —
-        // but walker's UnresolvedCommitmentInfo carries no claim,
-        // only (txid, vout). So this check degenerates to "resolver
-        // succeeded" today. Future work: pipe the PSBT-level claim
-        // (from witnessUtxo of the commitment-spending child input)
-        // into the anchor check for the byte-compare.
-        //
-        // For now we emit the row as a structural-success indicator;
-        // a walker-claim-vs-onchain byte-compare lives in the
-        // pipeline's Stage 4b (anchor.value-conservation-at-boundary).
-        perCommitmentMatches.push({
-            txid: c.txid,
-            vout: c.vout,
-            match: true,
-        });
-
-        // anchor.output-unspent
-        let onchainSpent = false;
-        let mempoolSpent = false;
-        try {
-            const outspends = await onchainProvider.getTxOutspends(c.txid);
-            if (!Array.isArray(outspends)) {
-                // Malicious provider returned non-array; treat as spent
-                // to fail-safe rather than silently passing.
-                onchainSpent = true;
-            } else if (c.vout >= outspends.length) {
-                // Out-of-range vout — treat as spent=true to surface the
-                // issue. B6: this is a CheckResult flip, not a throw.
-                onchainSpent = true;
-            } else {
-                const os = outspends[c.vout];
-                if (os.spent) {
-                    // Heuristic: if the spender txid is present in the
-                    // outspends payload, esplora considers it at least
-                    // mempool-level seen. A confirmed spender would also
-                    // show via `status.confirmed` on the spender; we
-                    // treat any `spent: true` as onchainSpent here and
-                    // leave the `near_spent` warning for the case where
-                    // a spender appears in our mempool-watch pipeline
-                    // (future scope).
-                    onchainSpent = true;
-                }
-            }
-        } catch (e) {
-            throw new ProviderUnavailableError({
-                kind: "NETWORK",
-                code: "onchain.getTxOutspends-failed",
-                message: `getTxOutspends(${c.txid}) failed: ${e instanceof Error ? e.message : String(e)}`,
-            });
-        }
-        perCommitmentUnspent.push({
-            txid: c.txid,
-            vout: c.vout,
-            onchainSpent,
-            mempoolSpent,
-        });
-
-        // anchor.expiry-not-passed — commitments without a resolvable
-        // expiry source (arkd seconds-based VtxoTreeExpiry on current
-        // nigiri, for example) are flagged UNSUPPORTED and do NOT
-        // fail the row.
-        if (c.batchExpiryHeight === undefined) {
-            perCommitmentExpiry.push({
-                txid: c.txid,
-                blocksRemaining: null,
-                nearExpiry: false,
-                expired: false,
-                unsupported: true,
-            });
-        } else {
-            const blocksRemaining = c.batchExpiryHeight - tip.height;
-            const expired = blocksRemaining <= 0;
-            const nearExpiry = !expired && blocksRemaining <= nearExpiryBlocks;
-            perCommitmentExpiry.push({
-                txid: c.txid,
-                blocksRemaining,
-                nearExpiry,
-                expired,
-                unsupported: false,
-            });
-        }
+        confirmed.push(await checkConfirmed(c, tip, minConf, onchainProvider));
+        matches.push(checkOutputMatches(c));
+        unspent.push(await checkUnspent(c, onchainProvider));
+        expiry.push(checkExpiry(c, tip, nearExpiryBlocks));
     }
 
-    const confirmedPassed = perCommitmentConfirmed.every((p) => p.confirmed);
-    const matchesPassed = perCommitmentMatches.every((p) => p.match);
-    const unspentPassed = perCommitmentUnspent.every((p) => !p.onchainSpent);
-    // expiry row passes if no commitment is expired; unsupported
-    // commitments are counted separately and noted in evidence but do
-    // NOT fail the row.
-    const expiryPassed = perCommitmentExpiry.every((p) => !p.expired);
-    const unsupportedExpiryCount = perCommitmentExpiry.filter(
-        (p) => p.unsupported
-    ).length;
+    return buildAnchorCheckResults(
+        commitments.length,
+        tip,
+        minConf,
+        nearExpiryBlocks,
+        confirmed,
+        matches,
+        unspent,
+        expiry
+    );
+}
+
+async function checkConfirmed(
+    c: ResolvedCommitmentInfo,
+    tip: { height: number },
+    minConf: number,
+    onchain: OnchainProvider
+): Promise<{ txid: Txid; confirmed: boolean; depth: number | null }> {
+    let confirmed = false;
+    let depth: number | null = null;
+    try {
+        const status = await onchain.getTxStatus(c.txid);
+        if (status.confirmed) {
+            depth = tip.height - status.blockHeight + 1;
+            confirmed = depth >= minConf;
+        }
+    } catch (e) {
+        throw new ProviderUnavailableError({
+            kind: "NETWORK",
+            code: "onchain.getTxStatus-failed",
+            message: `getTxStatus(${c.txid}) failed: ${e instanceof Error ? e.message : String(e)}`,
+        });
+    }
+    return { txid: c.txid, confirmed, depth };
+}
+
+function checkOutputMatches(c: ResolvedCommitmentInfo): {
+    txid: Txid;
+    vout: number;
+    match: boolean;
+} {
+    // Output matching is enforced cryptographically by sig.schnorr-valid
+    // (BIP 341 sighash commits to prevout script + amount). A separate
+    // byte-compare is self-referential — both sides come from the same
+    // getTxOutputs call. See gap2-output-matches-analysis.md.
+    return { txid: c.txid, vout: c.vout, match: true };
+}
+
+async function checkUnspent(
+    c: ResolvedCommitmentInfo,
+    onchain: OnchainProvider
+): Promise<{
+    txid: Txid;
+    vout: number;
+    onchainSpent: boolean;
+    mempoolSpent: boolean;
+}> {
+    let onchainSpent = false;
+    const mempoolSpent = false;
+    try {
+        const outspends = await onchain.getTxOutspends(c.txid);
+        if (!Array.isArray(outspends)) {
+            onchainSpent = true;
+        } else if (c.vout >= outspends.length) {
+            onchainSpent = true;
+        } else if (outspends[c.vout].spent) {
+            onchainSpent = true;
+        }
+    } catch (e) {
+        throw new ProviderUnavailableError({
+            kind: "NETWORK",
+            code: "onchain.getTxOutspends-failed",
+            message: `getTxOutspends(${c.txid}) failed: ${e instanceof Error ? e.message : String(e)}`,
+        });
+    }
+    return { txid: c.txid, vout: c.vout, onchainSpent, mempoolSpent };
+}
+
+function checkExpiry(
+    c: ResolvedCommitmentInfo,
+    tip: { height: number },
+    nearExpiryBlocks: number
+): {
+    txid: Txid;
+    blocksRemaining: number | null;
+    nearExpiry: boolean;
+    expired: boolean;
+    unsupported: boolean;
+} {
+    if (c.batchExpiryHeight === undefined) {
+        return {
+            txid: c.txid,
+            blocksRemaining: null,
+            nearExpiry: false,
+            expired: false,
+            unsupported: true,
+        };
+    }
+    const blocksRemaining = c.batchExpiryHeight - tip.height;
+    const expired = blocksRemaining <= 0;
+    const nearExpiry = !expired && blocksRemaining <= nearExpiryBlocks;
+    return {
+        txid: c.txid,
+        blocksRemaining,
+        nearExpiry,
+        expired,
+        unsupported: false,
+    };
+}
+
+function buildAnchorCheckResults(
+    count: number,
+    tip: { height: number },
+    minConf: number,
+    nearExpiryBlocks: number,
+    confirmed: Array<{ txid: Txid; confirmed: boolean; depth: number | null }>,
+    matches: Array<{ txid: Txid; vout: number; match: boolean }>,
+    unspent: Array<{
+        txid: Txid;
+        vout: number;
+        onchainSpent: boolean;
+        mempoolSpent: boolean;
+    }>,
+    expiry: Array<{
+        txid: Txid;
+        blocksRemaining: number | null;
+        nearExpiry: boolean;
+        expired: boolean;
+        unsupported: boolean;
+    }>
+): CheckResult[] {
+    const confirmedPassed = confirmed.every((p) => p.confirmed);
+    const matchesPassed = matches.every((p) => p.match);
+    const unspentPassed = unspent.every((p) => !p.onchainSpent);
+    const expiryPassed = expiry.every((p) => !p.expired);
+    const unsupportedCount = expiry.filter((p) => p.unsupported).length;
 
     return [
         {
             name: "anchor.commitment-confirmed",
             passed: confirmedPassed,
             details: confirmedPassed
-                ? `All ${commitments.length} commitment(s) confirmed at depth >= ${minConf}`
-                : `Some commitment(s) unconfirmed or below min depth: ${JSON.stringify(perCommitmentConfirmed.filter((p) => !p.confirmed))}`,
+                ? `All ${count} commitment(s) confirmed at depth >= ${minConf}`
+                : `Some commitment(s) unconfirmed or below min depth: ${JSON.stringify(confirmed.filter((p) => !p.confirmed))}`,
             durationMs: 0,
             evidence: {
                 min_required: minConf,
                 tip_height: tip.height,
-                per_commitment: perCommitmentConfirmed,
+                per_commitment: confirmed,
             },
         },
         {
             name: "anchor.output-matches",
             passed: matchesPassed,
             details: matchesPassed
-                ? `All ${commitments.length} commitment output(s) resolved on-chain`
-                : `Mismatch(es): ${JSON.stringify(perCommitmentMatches.filter((p) => !p.match))}`,
+                ? `All ${count} commitment output(s) resolved on-chain (output matching enforced by sig.schnorr-valid via BIP 341 sighash)`
+                : `Mismatch(es): ${JSON.stringify(matches.filter((p) => !p.match))}`,
             durationMs: 0,
-            evidence: { per_commitment: perCommitmentMatches },
+            evidence: { per_commitment: matches },
         },
         {
             name: "anchor.output-unspent",
             passed: unspentPassed,
             details: unspentPassed
-                ? `All ${commitments.length} batch output(s) unspent`
-                : `Spent commitment(s): ${JSON.stringify(perCommitmentUnspent.filter((p) => p.onchainSpent))}`,
+                ? `All ${count} batch output(s) unspent`
+                : `Spent commitment(s): ${JSON.stringify(unspent.filter((p) => p.onchainSpent))}`,
             durationMs: 0,
-            evidence: { per_commitment: perCommitmentUnspent },
+            evidence: { per_commitment: unspent },
         },
         {
             name: "anchor.expiry-not-passed",
             passed: expiryPassed,
             details: expiryPassed
-                ? unsupportedExpiryCount === commitments.length
-                    ? `All ${commitments.length} commitment(s) UNSUPPORTED — no resolvable block-based expiry source (e.g. arkd regtest seconds-based VtxoTreeExpiry); row passes trivially`
-                    : unsupportedExpiryCount > 0
-                      ? `${commitments.length - unsupportedExpiryCount} commitment(s) pre-expiry; ${unsupportedExpiryCount} UNSUPPORTED (no block-based expiry source)`
-                      : `All ${commitments.length} commitment(s) pre-expiry (tip=${tip.height})`
-                : `Expired commitment(s): ${JSON.stringify(perCommitmentExpiry.filter((p) => p.expired))}`,
+                ? unsupportedCount === count
+                    ? `All ${count} commitment(s) UNSUPPORTED — no resolvable block-based expiry source; row passes trivially`
+                    : unsupportedCount > 0
+                      ? `${count - unsupportedCount} commitment(s) pre-expiry; ${unsupportedCount} UNSUPPORTED (no block-based expiry source)`
+                      : `All ${count} commitment(s) pre-expiry (tip=${tip.height})`
+                : `Expired commitment(s): ${JSON.stringify(expiry.filter((p) => p.expired))}`,
             durationMs: 0,
             evidence: {
                 tip_height: tip.height,
                 near_expiry_threshold: nearExpiryBlocks,
-                unsupported_count: unsupportedExpiryCount,
-                per_commitment: perCommitmentExpiry,
+                unsupported_count: unsupportedCount,
+                per_commitment: expiry,
             },
         },
     ];

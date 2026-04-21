@@ -35,7 +35,7 @@ export interface UnilateralExitBundle {
     readonly transactionPath: readonly ExitPathEntry[];
     readonly claimTemplate: ClaimTemplate;
     readonly csvDelayBlocks: number;
-    readonly batchExpiryHeight: BlockHeight;
+    readonly batchExpiryHeight?: BlockHeight;
     readonly broadcastSchedule: readonly PerPathSchedule[];
     readonly capturedAt: string; // ISO-8601
 }

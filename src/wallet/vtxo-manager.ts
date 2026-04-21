@@ -1027,6 +1027,13 @@ export class VtxoManager implements AsyncDisposable, IVtxoManager {
                     .catch((e) => {
                         console.error("Error delegating VTXOs:", e);
                     });
+
+                // §3.3 exit-data capture hook point: call
+                // captureExitData() here for each new VTXO to
+                // pre-store unilateral exit data. Requires
+                // IndexerProvider + OnchainProvider + ExitDataRepository
+                // to be available in this scope. See
+                // src/exit/bundle-builder.ts::captureExitData().
             });
 
             return stopWatching;

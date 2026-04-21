@@ -47,7 +47,10 @@ export class InMemoryExitDataRepository implements ExitDataRepository {
     async pruneExpired(currentBlockHeight: number): Promise<number> {
         let pruned = 0;
         for (const [id, bundle] of this.store) {
-            if (bundle.batchExpiryHeight < currentBlockHeight) {
+            if (
+                bundle.batchExpiryHeight !== undefined &&
+                bundle.batchExpiryHeight < currentBlockHeight
+            ) {
                 this.store.delete(id);
                 pruned++;
             }

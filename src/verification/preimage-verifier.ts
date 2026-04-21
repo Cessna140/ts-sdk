@@ -168,11 +168,17 @@ export async function verifyPreimages(
         const txid = entry.tx.id as Txid;
         for (let j = 0; j < entry.tx.inputsLength; j++) {
             const inp = entry.tx.getInput(j);
-            const tapLeaves = inp.tapLeafScript as
-                | ReadonlyArray<readonly [unknown, Uint8Array]>
-                | undefined;
-            if (!tapLeaves) continue;
-            for (const leaf of tapLeaves) {
+            const rawLeaves = inp.tapLeafScript;
+            if (!Array.isArray(rawLeaves) || rawLeaves.length === 0) continue;
+            for (const leaf of rawLeaves as ReadonlyArray<
+                readonly [unknown, Uint8Array]
+            >) {
+                if (
+                    !Array.isArray(leaf) ||
+                    !(leaf[1] instanceof Uint8Array) ||
+                    leaf[1].length < 2
+                )
+                    continue;
                 scriptsScanned++;
                 // leaf[1] = script || leafVersion byte
                 const scriptBytes = leaf[1].subarray(0, leaf[1].length - 1);

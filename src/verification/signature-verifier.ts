@@ -268,24 +268,20 @@ export async function verifySignatures(
                 }
             } else {
                 // script-path: iterate every tapScriptSig
-                const tapScriptSig = inp.tapScriptSig as ReadonlyArray<
-                    readonly [
-                        {
-                            pubKey: Uint8Array;
-                            leafHash: Uint8Array;
-                        },
-                        Uint8Array,
-                    ]
-                >;
-                const tapLeafScriptField = inp.tapLeafScript as
-                    | ReadonlyArray<
-                          readonly [
-                              unknown,
-                              Uint8Array /* script || leafVersion byte */,
-                          ]
-                      >
-                    | undefined;
-                if (!tapLeafScriptField || tapLeafScriptField.length === 0) {
+                const tapScriptSig = inp.tapScriptSig;
+                if (!Array.isArray(tapScriptSig) || tapScriptSig.length === 0) {
+                    throw new MalformedChainError({
+                        kind: "DATA",
+                        code: "sig.missing-tapscriptsig",
+                        message: `Tx ${txid} input ${j} script-path missing tapScriptSig`,
+                        context: { txid, input_index: j },
+                    });
+                }
+                const tapLeafScriptField = inp.tapLeafScript;
+                if (
+                    !Array.isArray(tapLeafScriptField) ||
+                    tapLeafScriptField.length === 0
+                ) {
                     throw new MalformedChainError({
                         kind: "DATA",
                         code: "sig.missing-tapleaf-script",
@@ -294,7 +290,25 @@ export async function verifySignatures(
                     });
                 }
                 for (let k = 0; k < tapScriptSig.length; k++) {
-                    const [meta, sig] = tapScriptSig[k];
+                    const entry_k = tapScriptSig[k];
+                    if (
+                        !Array.isArray(entry_k) ||
+                        entry_k.length < 2 ||
+                        !entry_k[0]?.pubKey ||
+                        !entry_k[0]?.leafHash ||
+                        !(entry_k[1] instanceof Uint8Array)
+                    ) {
+                        throw new MalformedChainError({
+                            kind: "DATA",
+                            code: "sig.malformed-tapscriptsig",
+                            message: `Tx ${txid} input ${j} tapScriptSig[${k}] has unexpected shape`,
+                            context: { txid, input_index: j, k },
+                        });
+                    }
+                    const [meta, sig] = entry_k as [
+                        { pubKey: Uint8Array; leafHash: Uint8Array },
+                        Uint8Array,
+                    ];
                     if (sig.length !== 64 && sig.length !== 65) {
                         throw new MalformedChainError({
                             kind: "DATA",
@@ -311,7 +325,15 @@ export async function verifySignatures(
                     // Find matching tapLeafScript by leafHash.
                     let matchedScript: Uint8Array | undefined;
                     let matchedLeafVersion: number | undefined;
-                    for (const leaf of tapLeafScriptField) {
+                    for (const leaf of tapLeafScriptField as ReadonlyArray<
+                        readonly [unknown, Uint8Array]
+                    >) {
+                        if (
+                            !Array.isArray(leaf) ||
+                            !(leaf[1] instanceof Uint8Array) ||
+                            leaf[1].length < 2
+                        )
+                            continue;
                         const scriptBytes = leaf[1];
                         // leafHash expected = tapLeafHash(leafVersion, script)
                         const lv = scriptBytes[scriptBytes.length - 1];
@@ -409,9 +431,9 @@ export async function verifySignatures(
             if (cosigners.length === 0) continue;
             cosignerInputsChecked++;
 
-            const cosignerKeys = cosigners
-                .sort((a, b) => a.index - b.index)
-                .map((c) => c.key);
+            // aggregateKeys(keys, sort=true) handles BIP 327 key
+            // sorting internally — no pre-sort by index needed.
+            const cosignerKeys = cosigners.map((c) => c.key);
 
             if (cosignerKeys.some((k) => k.length !== 33)) {
                 cosignerFailDetails.push(
@@ -426,6 +448,18 @@ export async function verifySignatures(
             let sweepTimelock:
                 | { type: "blocks" | "seconds"; value: bigint }
                 | undefined;
+
+            // Cap taptree blob size to prevent DoS via crafted PSBT.
+            const MAX_TAPTREE_BLOB_BYTES = 100_000;
+            if (
+                treeBlobs.length > 0 &&
+                treeBlobs[0].length > MAX_TAPTREE_BLOB_BYTES
+            ) {
+                cosignerFailDetails.push(
+                    `${txid} input ${j} VtxoTaprootTree blob too large (${treeBlobs[0].length} bytes)`
+                );
+                continue;
+            }
 
             if (treeBlobs.length > 0) {
                 try {
@@ -460,6 +494,10 @@ export async function verifySignatures(
             }
 
             if (!merkleRoot) {
+                // Real arkd key-path PSBTs carry CosignerPublicKey
+                // but not VtxoTaprootTree. Without the taptree we
+                // cannot verify the aggregate — record as unverifiable
+                // (not a match, not a failure).
                 cosignerInputsNoTree++;
                 continue;
             }
@@ -503,6 +541,10 @@ export async function verifySignatures(
                         expiry.value === sweepTimelock.value
                     ) {
                         expiryMatched++;
+                    } else {
+                        cosignerFailDetails.push(
+                            `${txid} input ${j} sweep timelock (${sweepTimelock.type}:${sweepTimelock.value}) != VtxoTreeExpiry (${expiry.type}:${expiry.value})`
+                        );
                     }
                 }
             }

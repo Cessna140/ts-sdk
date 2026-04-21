@@ -120,8 +120,11 @@ function keyStartsWith(keyBytes: Uint8Array, prefix: string): boolean {
  * array of `{depth: U8, version: U8, script: VarBytes}`). Returns the
  * leaf-hash array for merkle-containment checks.
  */
+const MAX_TAPTREE_BLOB_BYTES = 100_000;
+
 function decodeVtxoTaprootTree(blob: Uint8Array): readonly Uint8Array[] | null {
     if (blob.length === 0) return [];
+    if (blob.length > MAX_TAPTREE_BLOB_BYTES) return null;
     try {
         const decoded = TapTreeCoder.decode(blob) as ReadonlyArray<{
             depth: number;
@@ -233,19 +236,28 @@ export async function verifyScripts(
 
         for (let j = 0; j < entry.tx.inputsLength; j++) {
             const inp = entry.tx.getInput(j);
-            const tapLeafField = inp.tapLeafScript as
-                | ReadonlyArray<
-                      readonly [
-                          {
-                              version: number;
-                              internalKey: Uint8Array;
-                              merklePath: Uint8Array[];
-                          },
-                          Uint8Array,
-                      ]
-                  >
-                | undefined;
-            if (!tapLeafField || tapLeafField.length === 0) continue;
+            const rawTapLeaf = inp.tapLeafScript;
+            if (!Array.isArray(rawTapLeaf) || rawTapLeaf.length === 0) continue;
+            // Validate first entry's shape before trusting the cast.
+            const sample = rawTapLeaf[0];
+            if (
+                !Array.isArray(sample) ||
+                sample.length < 2 ||
+                typeof sample[0]?.version !== "number" ||
+                !(sample[0]?.internalKey instanceof Uint8Array) ||
+                !(sample[1] instanceof Uint8Array)
+            )
+                continue;
+            const tapLeafField = rawTapLeaf as ReadonlyArray<
+                readonly [
+                    {
+                        version: number;
+                        internalKey: Uint8Array;
+                        merklePath: Uint8Array[];
+                    },
+                    Uint8Array,
+                ]
+            >;
 
             const parentScript = entry.perInputPrevouts[j].script;
             const parentKey = p2trXOnlyKey(parentScript);
@@ -369,19 +381,22 @@ export async function verifyScripts(
             const entry = byTxid.get(edge.childTxid);
             if (!entry) continue;
             const inp = entry.tx.getInput(edge.inputIndex);
-            const tapLeafField = inp.tapLeafScript as
-                | ReadonlyArray<
-                      readonly [{ internalKey: Uint8Array }, Uint8Array]
-                  >
-                | undefined;
-            if (!tapLeafField || tapLeafField.length === 0) {
+            const rawTapLeafNums = inp.tapLeafScript;
+            if (!Array.isArray(rawTapLeafNums) || rawTapLeafNums.length === 0) {
                 // Key-path commitment input has no tapleaf; NUMS is
                 // enforced implicitly by the MuSig2 aggregate tweak —
                 // skip here (exercised by sig.musig2-aggregate-valid).
                 continue;
             }
+            const firstEntry = rawTapLeafNums[0];
+            if (
+                !Array.isArray(firstEntry) ||
+                !(firstEntry[0]?.internalKey instanceof Uint8Array)
+            ) {
+                continue;
+            }
             numsChecked++;
-            const internalKey = tapLeafField[0][0].internalKey;
+            const internalKey = firstEntry[0].internalKey as Uint8Array;
             if (bytesEqual(internalKey, TAPROOT_UNSPENDABLE_KEY)) {
                 numsMatched++;
             } else {

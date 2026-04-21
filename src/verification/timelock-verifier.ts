@@ -80,7 +80,11 @@ function coerceToNumber(push: unknown): number | null {
             n |= BigInt(push[i]) << BigInt(8 * i);
         }
         const signBit = 1n << BigInt(8 * push.length - 1);
-        if (n & signBit) return -Number(n & (signBit - 1n));
+        if (n & signBit) {
+            const magnitude = n & (signBit - 1n);
+            if (magnitude > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+            return -Number(magnitude);
+        }
         if (n > BigInt(Number.MAX_SAFE_INTEGER)) return null;
         return Number(n);
     }

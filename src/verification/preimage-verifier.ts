@@ -14,6 +14,7 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ripemd160 } from "@noble/hashes/legacy.js";
 import { MalformedChainError } from "./errors";
+import { ConditionWitness } from "../utils/unknownFields";
 import type { CheckResult, SignaturePathEntry, Txid } from "./types";
 
 /** Maximum preimage candidates extracted per tx — DoS bound. */
@@ -210,13 +211,44 @@ export async function verifyPreimages(
         const candidates: Uint8Array[] = [];
         for (let j = 0; j < entry.tx.inputsLength; j++) {
             const inp = entry.tx.getInput(j);
+
+            // Source 1: finalScriptWitness (post-finalization witness stack).
             const stack = inp.finalScriptWitness as
                 | ReadonlyArray<Uint8Array>
                 | undefined;
-            if (!stack) continue;
-            for (const el of stack) {
-                if (candidates.length >= MAX_PREIMAGE_CANDIDATES) break;
-                candidates.push(el);
+            if (stack) {
+                for (const el of stack) {
+                    if (candidates.length >= MAX_PREIMAGE_CANDIDATES) break;
+                    candidates.push(el);
+                }
+            }
+
+            // Source 2: ConditionWitness Ark PSBT field (pre-finalization).
+            // For VHTLC claim paths, the SDK stores the preimage in
+            // this field during intent construction. Pre-signed txs
+            // don't carry finalScriptWitness (BIP 174 finalization
+            // happens at broadcast), so this is the primary preimage
+            // source for presigned Ark transactions.
+            const unknownFields = inp.unknown as
+                | NonNullable<typeof inp.unknown>
+                | undefined;
+            if (unknownFields) {
+                for (const pair of unknownFields) {
+                    try {
+                        const decoded = ConditionWitness.decode(pair);
+                        if (!decoded) continue;
+                        for (const element of decoded) {
+                            if (candidates.length >= MAX_PREIMAGE_CANDIDATES)
+                                break;
+                            candidates.push(element);
+                        }
+                    } catch {
+                        // Not a ConditionWitness field — skip silently.
+                        // Other Ark PSBT fields (VtxoTaprootTree, Cosigner,
+                        // VtxoTreeExpiry) will fail to decode as
+                        // ConditionWitness; this is expected.
+                    }
+                }
             }
         }
         candidatesExtracted += candidates.length;

@@ -92,5 +92,17 @@ describe("§3.2.3 Boltz VHTLC: preimage verifier recognises HASH160 claim", () =
         const vtree = byName.get("script.vtxotaprootree-valid");
         expect(vtree?.evidence?.vtxotree_checks).toBeGreaterThanOrEqual(1);
         expect(vtree?.evidence?.vtxotree_matched).toBeGreaterThanOrEqual(1);
+
+        // §3.2.3 preimage matching: the ConditionWitness PSBT field
+        // carries the preimage (set during intent construction per
+        // src/contracts/handlers/vhtlc.ts:114). The verifier extracts
+        // it, hashes it, and compares against the HASH160 commitment
+        // found in the claim leaf. This is the "verify that the
+        // provided preimage correctly satisfies the hash condition"
+        // deliverable.
+        const preMatch = byName.get("preimage.hashes-match");
+        expect(preMatch?.passed).toBe(true);
+        expect(preMatch?.evidence?.preimages_matched).toBeGreaterThanOrEqual(1);
+        expect(preMatch?.evidence?.preimages_mismatched).toBe(0);
     });
 });

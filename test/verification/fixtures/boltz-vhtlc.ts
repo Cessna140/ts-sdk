@@ -35,6 +35,7 @@ import { Transaction } from "@scure/btc-signer/transaction.js";
 import {
     setArkPsbtField,
     VtxoTaprootTree,
+    ConditionWitness,
 } from "../../../src/utils/unknownFields";
 import { VHTLC } from "../../../src/script/vhtlc";
 import type { ChainTx, VtxoChain } from "../../../src/providers/indexer";
@@ -165,6 +166,14 @@ export function buildBoltzVhtlcFixture(opts?: {
     // (matches what arkd would emit).
     const treeBlob = vhtlc.encode();
     setArkPsbtField(tx, 0, VtxoTaprootTree, treeBlob);
+
+    // Attach the preimage via ConditionWitness — this is how the SDK
+    // stores preimages on VHTLC claim inputs during intent construction
+    // (src/contracts/handlers/vhtlc.ts:114 → src/intent/index.ts:312).
+    // Pre-signed txs don't carry finalScriptWitness (BIP 174
+    // finalization happens at broadcast), so ConditionWitness is the
+    // preimage source for the preimage verifier.
+    setArkPsbtField(tx, 0, ConditionWitness, [preimage]);
 
     const psbtBytes = tx.toPSBT();
     const psbtBase64 = base64.encode(psbtBytes);

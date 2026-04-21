@@ -261,21 +261,68 @@ export function buildDag(
 }
 
 /**
- * Full walker entry point. Fetches the chain, builds the DAG, fetches
- * virtual-tx PSBTs for every off-chain node, and emits the six
- * `chain.*` check rows. Does not throw on tamper — invariant failures
- * land as `CheckResult(passed:false)` rows. Does throw
- * {@link MalformedChainError} on structurally unparseable input and
- * {@link ProviderUnavailableError} on transport failure.
+ * Full walker entry point. Fetches the chain, builds the DAG, parses
+ * PSBTs, and emits 9 `chain.*` check rows. Does not throw on tamper —
+ * failures land as `CheckResult(passed:false)`. Throws on structurally
+ * unparseable input or transport failure.
  */
 export async function walkChain(
     input: ChainWalkerInput
 ): Promise<DagWalkerOutput> {
-    const { vtxo, indexerProvider, signal } = input;
-    const feeTolerance = input.feeToleranceSats ?? DEFAULT_FEE_TOLERANCE_SATS;
+    const { signal } = input;
     throwIfAborted(signal);
 
     const checks: CheckResult[] = [];
+
+    // Phase 1: Fetch chain + build DAG
+    const { graph, orderedTxids, path } = await fetchAndBuildDag(input, checks);
+
+    // Phase 2: Parse PSBTs for off-chain nodes
+    const parsed = await fetchAndParsePsbts(
+        graph,
+        orderedTxids,
+        path,
+        input,
+        signal
+    );
+
+    // Phase 3: Per-edge structural checks
+    checks.push(
+        ...checkEdgeIntegrity(
+            graph,
+            orderedTxids,
+            parsed,
+            input.feeToleranceSats ?? DEFAULT_FEE_TOLERANCE_SATS,
+            signal
+        )
+    );
+
+    // Phase 4: VtxoTaprootTree decode check
+    checks.push(checkScriptTreeBlobs(path, parsed));
+
+    // Phase 5: Checkpoint CSV coherence
+    checks.push(checkCheckpointCsv(path, parsed, input.expectedCsvBlocks));
+
+    // Assemble output
+    const { commitments, dag, pathWithTx } = assembleOutput(
+        graph,
+        orderedTxids,
+        parsed
+    );
+    return { checks, dag, path: pathWithTx, commitments };
+}
+
+// ── Phase 1: Fetch chain + build DAG ────────────────────────────────
+
+async function fetchAndBuildDag(
+    input: ChainWalkerInput,
+    checks: CheckResult[]
+): Promise<{
+    graph: DagGraph;
+    orderedTxids: readonly Txid[];
+    path: readonly DagNode[];
+}> {
+    const { vtxo, indexerProvider } = input;
     const leafTxid = txidFromString(vtxo.txid);
 
     const fetchedAt = Date.now();
@@ -333,13 +380,23 @@ export async function walkChain(
         },
     });
 
+    return { graph, orderedTxids, path };
+}
+
+// ── Phase 2: Fetch + parse PSBTs ────────────────────────────────────
+
+async function fetchAndParsePsbts(
+    graph: DagGraph,
+    orderedTxids: readonly Txid[],
+    path: readonly DagNode[],
+    input: ChainWalkerInput,
+    signal?: AbortSignal
+): Promise<Map<Txid, Transaction>> {
     throwIfAborted(signal);
 
-    // Fetch virtual-tx PSBTs for every off-chain node. Commitments are
-    // on-chain; their bytes are the anchor verifier's concern.
     const offchainNodes = path.filter((n) => n.type !== ChainTxType.COMMITMENT);
     const rawTxs = await fetchRawTxs(
-        indexerProvider,
+        input.indexerProvider,
         offchainNodes.map((n) => n.txid)
     );
     const parsed = new Map<Txid, Transaction>();
@@ -355,9 +412,6 @@ export async function walkChain(
             });
         }
         try {
-            // allowUnknown: true so Ark-namespaced PSBT unknown fields
-            // (VtxoTaprootTree, Cosigner, ConditionWitness, VtxoTreeExpiry)
-            // survive the parse — the script-verifier consumes them.
             parsed.set(
                 txid,
                 Transaction.fromPSBT(base64.decode(psbtB64), {
@@ -373,36 +427,195 @@ export async function walkChain(
             });
         }
     }
+    return parsed;
+}
 
-    // Per-edge link, output-index, value-conservation, output-script.
-    const linkStart = Date.now();
-    let linksVerified = 0;
-    let linksFailed = 0;
-    const linkDetails: string[] = [];
-    let indicesChecked = 0;
-    let indicesFailed = 0;
-    const indexDetails: string[] = [];
-    let totalFeeLeakSats = 0n;
-    let valueInversions = 0;
-    const valueDetails: string[] = [];
-    const valueConservedTxs: Txid[] = [];
-    const valueSkippedTxs: Txid[] = [];
-    let scriptsChecked = 0;
-    let scriptsFailed = 0;
-    const scriptDetails: string[] = [];
+// ── Phase 3: Per-edge structural checks ─────────────────────────────
+
+// ── Per-check state objects ──────────────────────────────────────────
+
+interface LinkState {
+    verified: number;
+    failed: number;
+    details: string[];
+}
+
+interface IndexState {
+    checked: number;
+    failed: number;
+    details: string[];
+}
+
+interface ValueState {
+    totalFeeLeak: bigint;
+    inversions: number;
+    details: string[];
+    conserved: Txid[];
+    skipped: Txid[];
+}
+
+interface ScriptState {
+    checked: number;
+    failed: number;
+    details: string[];
+}
+
+interface InputCountState {
+    mismatches: number;
+    details: string[];
+}
+
+interface EdgeContext {
+    readonly graph: DagGraph;
+    readonly parsed: ReadonlyMap<Txid, Transaction>;
+}
+
+// ── Per-input check functions ───────────────────────────────────────
+
+function checkParentLink(
+    links: LinkState,
+    childTxid: Txid,
+    inputIndex: number,
+    parentTxid: Txid,
+    declaredParents: ReadonlySet<Txid>,
+    roots: ReadonlySet<Txid>,
+    inp: ReturnType<Transaction["getInput"]>,
+    ctx: EdgeContext
+): boolean {
+    const isInDag =
+        declaredParents.has(parentTxid) || ctx.graph.nodes.has(parentTxid);
+
+    if (!isInDag) {
+        const isP2A =
+            inp.witnessUtxo &&
+            inp.witnessUtxo.script.length === 4 &&
+            inp.witnessUtxo.script[0] === 0x51;
+        if (!isP2A) {
+            links.failed++;
+            links.details.push(
+                `${childTxid} input ${inputIndex} references unknown tx ${parentTxid} (not in DAG)`
+            );
+        }
+        return false; // not in DAG — skip downstream checks for this input
+    }
+
+    if (declaredParents.has(parentTxid) || roots.has(parentTxid)) {
+        links.verified++;
+    } else {
+        links.failed++;
+        links.details.push(
+            `${childTxid} input ${inputIndex} references ${parentTxid} which is not in declared parents or commitment roots`
+        );
+    }
+    return true;
+}
+
+function checkOutputIndex(
+    indices: IndexState,
+    childTxid: Txid,
+    parentTxid: Txid,
+    claimedVout: number,
+    ctx: EdgeContext
+): void {
+    const parentTx = ctx.parsed.get(parentTxid);
+    if (!parentTx) return;
+    indices.checked++;
+    if (claimedVout >= parentTx.outputsLength) {
+        indices.failed++;
+        indices.details.push(
+            `${childTxid} spends vout ${claimedVout} of ${parentTxid}, which has ${parentTx.outputsLength} output(s)`
+        );
+    }
+}
+
+function accumulateInputValue(
+    parentTxid: Txid,
+    claimedVout: number,
+    ctx: EdgeContext
+): { amount: bigint; resolved: boolean } {
+    const parentTx = ctx.parsed.get(parentTxid);
+    if (parentTx && claimedVout < parentTx.outputsLength) {
+        const out = parentTx.getOutput(claimedVout);
+        return { amount: out?.amount ?? 0n, resolved: true };
+    }
+    const parentNode = ctx.graph.nodes.get(parentTxid);
+    if (parentNode?.type === ChainTxType.COMMITMENT) {
+        return { amount: 0n, resolved: false };
+    }
+    return { amount: 0n, resolved: false };
+}
+
+function finalizeValueConservation(
+    values: ValueState,
+    childTxid: Txid,
+    childTx: Transaction,
+    spentInputSum: bigint,
+    hasUnresolved: boolean
+): void {
+    if (hasUnresolved) {
+        values.skipped.push(childTxid);
+        return;
+    }
+    const outSum = sumOutputs(childTx);
+    if (outSum > spentInputSum) {
+        values.inversions++;
+        values.details.push(
+            `${childTxid} outputs ${outSum} sats > inputs ${spentInputSum} sats (inflation ${outSum - spentInputSum})`
+        );
+    } else {
+        values.totalFeeLeak += spentInputSum - outSum;
+        values.conserved.push(childTxid);
+    }
+}
+
+function checkOutputScripts(
+    scripts: ScriptState,
+    childTxid: Txid,
+    childTx: Transaction,
+    seen: Set<Txid>
+): void {
+    if (seen.has(childTxid)) return;
+    seen.add(childTxid);
+    for (let v = 0; v < childTx.outputsLength; v++) {
+        const o = childTx.getOutput(v);
+        if (!o?.script) continue;
+        scripts.checked++;
+        if (!isAcceptableTreeOutput(o.script)) {
+            scripts.failed++;
+            scripts.details.push(
+                `${childTxid} vout ${v} is not P2TR or P2A (len ${o.script.length})`
+            );
+        }
+    }
+}
+
+// ── Edge integrity orchestrator ─────────────────────────────────────
+
+function checkEdgeIntegrity(
+    graph: DagGraph,
+    orderedTxids: readonly Txid[],
+    parsed: ReadonlyMap<Txid, Transaction>,
+    feeTolerance: bigint,
+    signal?: AbortSignal
+): CheckResult[] {
+    const start = Date.now();
+    const ctx: EdgeContext = { graph, parsed };
+    const links: LinkState = { verified: 0, failed: 0, details: [] };
+    const indices: IndexState = { checked: 0, failed: 0, details: [] };
+    const values: ValueState = {
+        totalFeeLeak: 0n,
+        inversions: 0,
+        details: [],
+        conserved: [],
+        skipped: [],
+    };
+    const scripts: ScriptState = { checked: 0, failed: 0, details: [] };
+    const inputCounts: InputCountState = { mismatches: 0, details: [] };
+    const seenScript = new Set<Txid>();
 
     const offchainTxids = orderedTxids.filter(
         (id) => graph.nodes.get(id)?.type !== ChainTxType.COMMITMENT
     );
-    const seenScript = new Set<Txid>();
-
-    // Count input/parent mismatches so they emit as a CheckResult row
-    // rather than a throw — a malicious indexer could desynchronise
-    // inputsLength vs declaredParents.length to force early exit and
-    // hide evidence from other checks. We keep the trace intact and
-    // iterate min(inputsLength, declaredParents.length) edges per tx.
-    let inputCountMismatches = 0;
-    const inputCountDetails: string[] = [];
 
     for (const childTxid of offchainTxids) {
         throwIfAborted(signal);
@@ -415,230 +628,159 @@ export async function walkChain(
                 context: { txid: childTxid },
             });
         }
-        const declaredParents = graph.parents.get(childTxid) ?? [];
-        // Note: input-count comparison between spends[] and
-        // tx.inputsLength is NOT reliable on real arkd data. Tree txs
-        // have P2A anchor inputs not tracked in spends[]; ARK txs
-        // declare more logical parents than PSBT inputs. The check
-        // row is emitted but never fails — per-input DAG membership
-        // is the real guard (see parent-link below).
-        // Build a set of declared-parent txids for membership lookup.
-        // The indexer's spends[] is a DAG-level set of parent txs, NOT
-        // a per-PSBT-input mapping. ARK-type txs may declare 2+ parents
-        // (the merged checkpoint chains) while the PSBT has only 1
-        // input. TREE txs may have 2 PSBT inputs (one spending the
-        // parent tree node + one P2A anchor) while spends[] only lists
-        // the tree-chain parent. We iterate every PSBT input and look
-        // up its claimed parent in the DAG by txid membership.
-        const declaredParentSet = new Set(declaredParents);
-        const rootSet = new Set(graph.roots);
 
+        const declaredParents = new Set(graph.parents.get(childTxid) ?? []);
+        const roots = new Set(graph.roots);
         let spentInputSum = 0n;
-        let childHasUnresolvedAmount = false;
+        let hasUnresolved = false;
 
         for (let i = 0; i < childTx.inputsLength; i++) {
-            const input = childTx.getInput(i);
-            if (!input?.txid || input.index === undefined) {
-                continue; // skip inputs we can't read (P2A anchors etc)
-            }
-            const claimedParentTxid = txidFromDisplayBytes(input.txid);
-            const claimedVout = input.index;
+            const inp = childTx.getInput(i);
+            if (!inp?.txid || inp.index === undefined) continue;
+            const parentTxid = txidFromDisplayBytes(inp.txid);
 
-            // Is this input's claimed parent in our DAG?
-            const parentNode = graph.nodes.get(claimedParentTxid);
-            const parentTx = parsed.get(claimedParentTxid);
-            const isInDag =
-                declaredParentSet.has(claimedParentTxid) ||
-                graph.nodes.has(claimedParentTxid);
+            const inDag = checkParentLink(
+                links,
+                childTxid,
+                i,
+                parentTxid,
+                declaredParents,
+                roots,
+                inp,
+                ctx
+            );
+            if (!inDag) continue;
 
-            if (!isInDag) {
-                // Input references a tx not in the DAG. On real arkd
-                // data this happens for P2A anchor inputs (4-byte
-                // script, tiny amount). For those, skip silently. For
-                // anything else, flag as a broken link.
-                const isP2A =
-                    input.witnessUtxo &&
-                    input.witnessUtxo.script.length === 4 &&
-                    input.witnessUtxo.script[0] === 0x51;
-                if (!isP2A) {
-                    linksFailed++;
-                    linkDetails.push(
-                        `${childTxid} input ${i} references unknown tx ${claimedParentTxid} (not in DAG)`
-                    );
-                }
-                continue;
-            }
+            checkOutputIndex(indices, childTxid, parentTxid, inp.index, ctx);
 
-            // parent-link: input must reference either a declared
-            // parent (from spends[]) or a commitment root (ARK txs
-            // may reference commitments directly while spends[]
-            // lists checkpoints). Anything else in the DAG is a
-            // mismatch between the indexer's declared edges and the
-            // PSBT's actual references — tamper-shaped.
-            if (
-                declaredParentSet.has(claimedParentTxid) ||
-                rootSet.has(claimedParentTxid)
-            ) {
-                linksVerified++;
-            } else {
-                linksFailed++;
-                linkDetails.push(
-                    `${childTxid} input ${i} references ${claimedParentTxid} which is not in declared parents or commitment roots`
-                );
-            }
-
-            // output-index (only when parent is parsed as PSBT)
-            if (parentTx) {
-                indicesChecked++;
-                if (claimedVout >= parentTx.outputsLength) {
-                    indicesFailed++;
-                    indexDetails.push(
-                        `${childTxid} spends vout ${claimedVout} of ${claimedParentTxid}, which has ${parentTx.outputsLength} output(s)`
-                    );
-                }
-            } else if (parentNode?.type === ChainTxType.COMMITMENT) {
-                // vout range on commitment outputs checked by anchor
-                // verifier (B6 — CheckResult, not throw).
-            }
-
-            // value accumulation
-            if (parentTx && claimedVout < parentTx.outputsLength) {
-                const out = parentTx.getOutput(claimedVout);
-                spentInputSum += out?.amount ?? 0n;
-            } else if (parentNode?.type === ChainTxType.COMMITMENT) {
-                childHasUnresolvedAmount = true;
-            } else {
-                childHasUnresolvedAmount = true;
-            }
+            const val = accumulateInputValue(parentTxid, inp.index, ctx);
+            spentInputSum += val.amount;
+            if (!val.resolved) hasUnresolved = true;
         }
 
-        if (!childHasUnresolvedAmount) {
-            const outSum = sumOutputs(childTx);
-            if (outSum > spentInputSum) {
-                valueInversions++;
-                valueDetails.push(
-                    `${childTxid} outputs ${outSum} sats > inputs ${spentInputSum} sats (inflation ${outSum - spentInputSum})`
-                );
-            } else {
-                totalFeeLeakSats += spentInputSum - outSum;
-                valueConservedTxs.push(childTxid);
-            }
-        } else {
-            // Tx has a COMMITMENT-typed parent whose batchAmount hasn't
-            // been resolved yet — the check is NOT exercised for this
-            // tx. The resolver wires the CommitmentResolver and re-runs value
-            // conservation across the commitment boundary.
-            valueSkippedTxs.push(childTxid);
-        }
-
-        if (!seenScript.has(childTxid)) {
-            seenScript.add(childTxid);
-            for (let v = 0; v < childTx.outputsLength; v++) {
-                const o = childTx.getOutput(v);
-                if (!o?.script) continue;
-                scriptsChecked++;
-                if (!isAcceptableTreeOutput(o.script)) {
-                    scriptsFailed++;
-                    scriptDetails.push(
-                        `${childTxid} vout ${v} is not P2TR or P2A (len ${o.script.length})`
-                    );
-                }
-            }
-        }
+        finalizeValueConservation(
+            values,
+            childTxid,
+            childTx,
+            spentInputSum,
+            hasUnresolved
+        );
+        checkOutputScripts(scripts, childTxid, childTx, seenScript);
     }
 
-    checks.push({
-        name: "chain.input-count-matches",
-        passed: inputCountMismatches === 0,
-        details:
-            inputCountMismatches === 0
-                ? "Every tx's PSBT input count matches its declared spends[] length"
-                : inputCountDetails.join("; "),
-        durationMs: 0,
-        evidence: {
-            mismatch_count: inputCountMismatches,
-            mismatches: inputCountDetails,
-        },
-    });
-    checks.push({
-        name: "chain.parent-link",
-        passed: linksFailed === 0,
-        details:
-            linksFailed === 0
-                ? `All ${linksVerified} parent link(s) match`
-                : `${linksFailed} broken link(s): ${linkDetails.join("; ")}`,
-        durationMs: Date.now() - linkStart,
-        evidence: {
-            edges_walked: linksVerified + linksFailed,
-            links_verified: linksVerified,
-            links_failed: linksFailed,
-        },
-    });
-    checks.push({
-        name: "chain.output-index",
-        passed: indicesFailed === 0,
-        details:
-            indicesFailed === 0
-                ? `All ${indicesChecked} output-index references in range`
-                : `${indicesFailed} out-of-range: ${indexDetails.join("; ")}`,
-        durationMs: 0,
-        evidence: {
-            indices_checked: indicesChecked,
-            indices_failed: indicesFailed,
-        },
-    });
-    const conservationOk =
-        valueInversions === 0 && totalFeeLeakSats <= feeTolerance;
-    const skippedLine =
-        valueSkippedTxs.length > 0
-            ? ` (${valueSkippedTxs.length} tx(s) skipped pending P5 commitment-amount resolution)`
-            : "";
-    checks.push({
-        name: "chain.value-conservation",
-        passed: conservationOk,
-        details: conservationOk
-            ? `Total fee leak ${totalFeeLeakSats} sats within tolerance ${feeTolerance}${skippedLine}`
-            : valueInversions > 0
-              ? `${valueInversions} value inflation(s): ${valueDetails.join("; ")}`
-              : `Fee leak ${totalFeeLeakSats} > tolerance ${feeTolerance}`,
-        durationMs: 0,
-        evidence: {
-            total_fee_leak_sats: totalFeeLeakSats.toString(),
-            fee_tolerance_sats: feeTolerance.toString(),
-            value_inversions: valueInversions,
-            txs_conserved: valueConservedTxs.length,
-            txs_skipped: valueSkippedTxs.length,
-            // Reviewers can see at a glance which txs bypassed the check
-            // because a commitment-amount wasn't available yet. Empty on
-            // single-root fully-resolvable DAGs; non-empty on Arkoor /
-            // multi-root DAGs until The resolver wires the resolver.
-            skipped_tx_ids: valueSkippedTxs,
-        },
-    });
-    checks.push({
-        name: "chain.output-script",
-        passed: scriptsFailed === 0,
-        details:
-            scriptsFailed === 0
-                ? `All ${scriptsChecked} output scripts are P2TR or P2A`
-                : `${scriptsFailed} malformed: ${scriptDetails.join("; ")}`,
-        durationMs: 0,
-        evidence: {
-            scripts_checked: scriptsChecked,
-            scripts_failed: scriptsFailed,
-        },
-    });
+    return buildEdgeCheckResults(
+        start,
+        feeTolerance,
+        links,
+        indices,
+        values,
+        scripts,
+        inputCounts
+    );
+}
 
-    // chain.output-script-tree-ok (P4): for every off-chain node that
-    // carries a VtxoTaprootTree PSBT field on any input, confirm the
-    // tree blob decodes without error. Deep containment (the executed
-    // tapleaf is IN the tree) is checked by the script verifier's
-    // script.vtxotaprootree-valid row — this walker row is the cheap
-    // structural sanity check.
-    const scriptTreeStart = Date.now();
-    let scriptTreeChecked = 0;
-    let scriptTreeFailed = 0;
-    const scriptTreeDetails: string[] = [];
+function buildEdgeCheckResults(
+    start: number,
+    feeTolerance: bigint,
+    links: LinkState,
+    indices: IndexState,
+    values: ValueState,
+    scripts: ScriptState,
+    inputCounts: InputCountState
+): CheckResult[] {
+    const conservationOk =
+        values.inversions === 0 && values.totalFeeLeak <= feeTolerance;
+    const skippedLine =
+        values.skipped.length > 0
+            ? ` (${values.skipped.length} tx(s) skipped pending commitment-amount resolution)`
+            : "";
+
+    return [
+        {
+            name: "chain.input-count-matches",
+            passed: inputCounts.mismatches === 0,
+            details:
+                inputCounts.mismatches === 0
+                    ? "Every tx's PSBT input count matches its declared spends[] length"
+                    : inputCounts.details.join("; "),
+            durationMs: 0,
+            evidence: {
+                mismatch_count: inputCounts.mismatches,
+                mismatches: inputCounts.details,
+            },
+        },
+        {
+            name: "chain.parent-link",
+            passed: links.failed === 0,
+            details:
+                links.failed === 0
+                    ? `All ${links.verified} parent link(s) match`
+                    : `${links.failed} broken link(s): ${links.details.join("; ")}`,
+            durationMs: Date.now() - start,
+            evidence: {
+                edges_walked: links.verified + links.failed,
+                links_verified: links.verified,
+                links_failed: links.failed,
+            },
+        },
+        {
+            name: "chain.output-index",
+            passed: indices.failed === 0,
+            details:
+                indices.failed === 0
+                    ? `All ${indices.checked} output-index references in range`
+                    : `${indices.failed} out-of-range: ${indices.details.join("; ")}`,
+            durationMs: 0,
+            evidence: {
+                indices_checked: indices.checked,
+                indices_failed: indices.failed,
+            },
+        },
+        {
+            name: "chain.value-conservation",
+            passed: conservationOk,
+            details: conservationOk
+                ? `Total fee leak ${values.totalFeeLeak} sats within tolerance ${feeTolerance}${skippedLine}`
+                : values.inversions > 0
+                  ? `${values.inversions} value inflation(s): ${values.details.join("; ")}`
+                  : `Fee leak ${values.totalFeeLeak} > tolerance ${feeTolerance}`,
+            durationMs: 0,
+            evidence: {
+                total_fee_leak_sats: values.totalFeeLeak.toString(),
+                fee_tolerance_sats: feeTolerance.toString(),
+                value_inversions: values.inversions,
+                txs_conserved: values.conserved.length,
+                txs_skipped: values.skipped.length,
+                skipped_tx_ids: values.skipped,
+            },
+        },
+        {
+            name: "chain.output-script",
+            passed: scripts.failed === 0,
+            details:
+                scripts.failed === 0
+                    ? `All ${scripts.checked} output scripts are P2TR or P2A`
+                    : `${scripts.failed} malformed: ${scripts.details.join("; ")}`,
+            durationMs: 0,
+            evidence: {
+                scripts_checked: scripts.checked,
+                scripts_failed: scripts.failed,
+            },
+        },
+    ];
+}
+
+// ── Phase 4: VtxoTaprootTree decode check ───────────────────────────
+
+function checkScriptTreeBlobs(
+    path: readonly DagNode[],
+    parsed: ReadonlyMap<Txid, Transaction>
+): CheckResult {
+    const start = Date.now();
+    let checked = 0;
+    let failed = 0;
+    const details: string[] = [];
+
     for (const node of path) {
         if (node.type === ChainTxType.COMMITMENT) continue;
         const parsedTx = parsed.get(node.txid);
@@ -652,9 +794,6 @@ export async function walkChain(
             >) {
                 const key = pair[0];
                 const blob = pair[1];
-                // Ark PSBT fields use type=222; the VtxoTaprootTree
-                // discriminator is the UTF-8 "taptree" prefix on the
-                // key bytes (see src/utils/unknownFields.ts).
                 if (
                     !key ||
                     key.type !== 222 ||
@@ -664,59 +803,58 @@ export async function walkChain(
                 const k = key.key;
                 if (
                     k.length < 7 ||
-                    k[0] !== 0x74 || // 't'
-                    k[1] !== 0x61 || // 'a'
-                    k[2] !== 0x70 || // 'p'
-                    k[3] !== 0x74 || // 't'
-                    k[4] !== 0x72 || // 'r'
-                    k[5] !== 0x65 || // 'e'
-                    k[6] !== 0x65 // 'e'
+                    k[0] !== 0x74 ||
+                    k[1] !== 0x61 ||
+                    k[2] !== 0x70 ||
+                    k[3] !== 0x74 ||
+                    k[4] !== 0x72 ||
+                    k[5] !== 0x65 ||
+                    k[6] !== 0x65
                 )
                     continue;
                 if (!(blob instanceof Uint8Array)) {
-                    scriptTreeFailed++;
-                    scriptTreeDetails.push(
+                    failed++;
+                    details.push(
                         `${node.txid} input ${j} VtxoTaprootTree blob is not bytes`
                     );
                     continue;
                 }
-                scriptTreeChecked++;
-                // Shape check via SDK's TapTreeCoder (BIP 371
-                // PSBT_OUT_TAP_TREE format: array of {depth, version,
-                // script}). Failure to decode = malformed blob.
+                checked++;
                 try {
                     TapTreeCoder.decode(blob);
                 } catch (e) {
-                    scriptTreeFailed++;
-                    scriptTreeDetails.push(
+                    failed++;
+                    details.push(
                         `${node.txid} input ${j} VtxoTaprootTree malformed: ${e instanceof Error ? e.message : String(e)}`
                     );
                 }
             }
         }
     }
-    checks.push({
-        name: "chain.output-script-tree-ok",
-        passed: scriptTreeFailed === 0,
-        details:
-            scriptTreeChecked === 0
-                ? "No VtxoTaprootTree PSBT fields in DAG (trivially ok)"
-                : scriptTreeFailed === 0
-                  ? `All ${scriptTreeChecked} VtxoTaprootTree field(s) decode cleanly`
-                  : scriptTreeDetails.join("; "),
-        durationMs: Date.now() - scriptTreeStart,
-        evidence: {
-            fields_checked: scriptTreeChecked,
-            fields_failed: scriptTreeFailed,
-        },
-    });
 
-    // chain.checkpoint-csv-coherent (§3.1.1 sweep-delay coherence, P2).
-    // For every CHECKPOINT node, decode its input 0 nSequence via BIP 68
-    // and confirm every checkpoint agrees on block count. If
-    // `expectedCsvBlocks` is supplied, require agreement with it too.
-    const csvStart = Date.now();
-    const checkpointObservations: Array<{
+    return {
+        name: "chain.output-script-tree-ok",
+        passed: failed === 0,
+        details:
+            checked === 0
+                ? "No VtxoTaprootTree PSBT fields in DAG (trivially ok)"
+                : failed === 0
+                  ? `All ${checked} VtxoTaprootTree field(s) decode cleanly`
+                  : details.join("; "),
+        durationMs: Date.now() - start,
+        evidence: { fields_checked: checked, fields_failed: failed },
+    };
+}
+
+// ── Phase 5: Checkpoint CSV coherence ───────────────────────────────
+
+function checkCheckpointCsv(
+    path: readonly DagNode[],
+    parsed: ReadonlyMap<Txid, Transaction>,
+    expectedCsvBlocks?: number
+): CheckResult {
+    const start = Date.now();
+    const observations: Array<{
         txid: Txid;
         observedBlocks: number | null;
     }> = [];
@@ -724,71 +862,76 @@ export async function walkChain(
         if (node.type !== ChainTxType.CHECKPOINT) continue;
         const parsedTx = parsed.get(node.txid);
         if (!parsedTx) continue;
-        const input = parsedTx.getInput(0);
-        const seq = input?.sequence ?? 0xffffffff;
-        const blocks = decodeBip68SequenceBlocks(seq);
-        checkpointObservations.push({
+        const inp = parsedTx.getInput(0);
+        const seq = inp?.sequence ?? 0xffffffff;
+        observations.push({
             txid: node.txid,
-            observedBlocks: blocks,
+            observedBlocks: decodeBip68SequenceBlocks(seq),
         });
     }
-    const csvMismatches: string[] = [];
-    let csvPassed = true;
+
+    const mismatches: string[] = [];
+    let passed = true;
     const distinctCsvs = new Set(
-        checkpointObservations
+        observations
             .map((o) => o.observedBlocks)
             .filter((v): v is number => v !== null)
     );
     if (distinctCsvs.size > 1) {
-        csvPassed = false;
-        csvMismatches.push(
+        passed = false;
+        mismatches.push(
             `CHECKPOINTs disagree on CSV: observed ${Array.from(distinctCsvs).join(", ")}`
         );
     }
-    if (
-        input.expectedCsvBlocks !== undefined &&
-        checkpointObservations.length > 0
-    ) {
-        for (const obs of checkpointObservations) {
-            if (obs.observedBlocks !== input.expectedCsvBlocks) {
-                csvPassed = false;
-                csvMismatches.push(
-                    `${obs.txid} observed ${obs.observedBlocks} blocks, expected ${input.expectedCsvBlocks}`
+    if (expectedCsvBlocks !== undefined && observations.length > 0) {
+        for (const obs of observations) {
+            if (obs.observedBlocks !== expectedCsvBlocks) {
+                passed = false;
+                mismatches.push(
+                    `${obs.txid} observed ${obs.observedBlocks} blocks, expected ${expectedCsvBlocks}`
                 );
             }
         }
     }
-    checks.push({
-        name: "chain.checkpoint-csv-coherent",
-        passed: csvPassed,
-        details:
-            checkpointObservations.length === 0
-                ? "No CHECKPOINT nodes in DAG (trivially coherent)"
-                : csvPassed
-                  ? `${checkpointObservations.length} CHECKPOINT(s) agree on CSV block count`
-                  : csvMismatches.join("; "),
-        durationMs: Date.now() - csvStart,
-        evidence: {
-            checkpoints_checked: checkpointObservations.length,
-            csv_observed: Array.from(distinctCsvs),
-            csv_expected: input.expectedCsvBlocks ?? null,
-            csv_mismatches: csvMismatches,
-        },
-    });
 
-    // Populate commitments[] — one UnresolvedCommitmentInfo per DAG root.
-    // For each commitment we record EVERY vout that any child claims to
-    // spend (bug #8 from P0-P2 review: v1 silently picked only the first
-    // child's claimed vout, losing the 2nd edge in Arkoor multi-input
-    // shapes). P5 resolves each (txid, vout) pair to a
-    // ResolvedCommitmentInfo via the on-chain outputs + CLTV parser.
+    return {
+        name: "chain.checkpoint-csv-coherent",
+        passed,
+        details:
+            observations.length === 0
+                ? "No CHECKPOINT nodes in DAG (trivially coherent)"
+                : passed
+                  ? `${observations.length} CHECKPOINT(s) agree on CSV block count`
+                  : mismatches.join("; "),
+        durationMs: Date.now() - start,
+        evidence: {
+            checkpoints_checked: observations.length,
+            csv_observed: Array.from(distinctCsvs),
+            csv_expected: expectedCsvBlocks ?? null,
+            csv_mismatches: mismatches,
+        },
+    };
+}
+
+// ── Assemble output ─────────────────────────────────────────────────
+
+function assembleOutput(
+    graph: DagGraph,
+    orderedTxids: readonly Txid[],
+    parsed: ReadonlyMap<Txid, Transaction>
+): {
+    commitments: UnresolvedCommitmentInfo[];
+    dag: DagGraph;
+    pathWithTx: DagNode[];
+} {
+    // Commitments: one per DAG root, recording every claimed vout.
     const voutsByRoot = new Map<Txid, Set<number>>();
     for (const root of graph.roots) voutsByRoot.set(root, new Set());
     for (const [childTxid, parentList] of graph.parents) {
         for (let i = 0; i < parentList.length; i++) {
             const parentTxid = parentList[i];
             const rootVouts = voutsByRoot.get(parentTxid);
-            if (!rootVouts) continue; // parent is not a root
+            if (!rootVouts) continue;
             const childTx = parsed.get(childTxid);
             if (!childTx) continue;
             const inp = childTx.getInput(i);
@@ -803,35 +946,23 @@ export async function walkChain(
         ),
     }));
 
-    // Re-assemble path AND graph.nodes with parsed Transactions attached
-    // on off-chain nodes, so downstream verifiers (signature / script /
-    // extractor) can consume the parsed shape via either API without
-    // re-parsing the PSBTs.
+    // Attach parsed Transactions to graph nodes.
     const updatedNodes = new Map<Txid, DagNode>();
     for (const [txid, node] of graph.nodes) {
         const parsedTx = parsed.get(txid);
-        if (parsedTx) {
-            updatedNodes.set(txid, { ...node, tx: parsedTx });
-        } else {
-            updatedNodes.set(txid, node);
-        }
+        updatedNodes.set(txid, parsedTx ? { ...node, tx: parsedTx } : node);
     }
-    const graphWithTx: DagGraph = {
+    const dag: DagGraph = {
         nodes: updatedNodes,
         parents: graph.parents,
         children: graph.children,
         roots: graph.roots,
     };
-    const pathWithTx: DagNode[] = path.map(
-        (node) => updatedNodes.get(node.txid) ?? node
+    const pathWithTx: DagNode[] = orderedTxids.map(
+        (id) => updatedNodes.get(id) ?? graph.nodes.get(id)!
     );
 
-    return {
-        checks,
-        dag: graphWithTx,
-        path: pathWithTx,
-        commitments,
-    };
+    return { commitments, dag, pathWithTx };
 }
 
 /**

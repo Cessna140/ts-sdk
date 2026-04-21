@@ -21,7 +21,6 @@
  * row in `errors[]` rather than silently passing.
  */
 
-import { sha256 } from "@noble/hashes/sha2.js";
 import { Transaction } from "@scure/btc-signer/transaction.js";
 import { tapLeafHash } from "@scure/btc-signer/payment.js";
 import { TapTreeCoder } from "../script/base";
@@ -37,6 +36,13 @@ import type {
     VerificationError,
 } from "./types";
 import type { DagAdapter } from "./chain-walker";
+import {
+    bytesEqual,
+    tapBranchHash,
+    p2trXOnlyKey,
+    throwIfAborted,
+    MAX_TAPTREE_BLOB_BYTES,
+} from "./utils";
 
 export interface ScriptVerifierInput {
     readonly path: readonly SignaturePathEntry[];
@@ -50,38 +56,6 @@ export interface ScriptVerifierOutput {
 }
 
 const LEAF_VERSION_TAPSCRIPT = 0xc0;
-
-/** TapBranch tagged hash: sha256(tag) || sha256(tag) || min(a,b) || max(a,b). */
-const TAP_BRANCH_TAG = sha256(new TextEncoder().encode("TapBranch"));
-function tapBranchHash(a: Uint8Array, b: Uint8Array): Uint8Array {
-    const [lo, hi] = compareBytes(a, b) <= 0 ? [a, b] : [b, a];
-    const buf = new Uint8Array(
-        TAP_BRANCH_TAG.length * 2 + lo.length + hi.length
-    );
-    buf.set(TAP_BRANCH_TAG, 0);
-    buf.set(TAP_BRANCH_TAG, TAP_BRANCH_TAG.length);
-    buf.set(lo, TAP_BRANCH_TAG.length * 2);
-    buf.set(hi, TAP_BRANCH_TAG.length * 2 + lo.length);
-    return sha256(buf);
-}
-
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-    const n = Math.min(a.length, b.length);
-    for (let i = 0; i < n; i++) {
-        if (a[i] !== b[i]) return a[i] - b[i];
-    }
-    return a.length - b.length;
-}
-
-import { equalBytes } from "@scure/btc-signer/utils.js";
-const bytesEqual = equalBytes;
-
-function p2trXOnlyKey(script: Uint8Array): Uint8Array | null {
-    if (script.length !== 34 || script[0] !== 0x51 || script[1] !== 0x20) {
-        return null;
-    }
-    return script.subarray(2);
-}
 
 /**
  * Ark protocol PSBT field key-type byte. Every Ark-namespaced
@@ -120,8 +94,6 @@ function keyStartsWith(keyBytes: Uint8Array, prefix: string): boolean {
  * array of `{depth: U8, version: U8, script: VarBytes}`). Returns the
  * leaf-hash array for merkle-containment checks.
  */
-const MAX_TAPTREE_BLOB_BYTES = 100_000;
-
 function decodeVtxoTaprootTree(blob: Uint8Array): readonly Uint8Array[] | null {
     if (blob.length === 0) return [];
     if (blob.length > MAX_TAPTREE_BLOB_BYTES) return null;
@@ -209,13 +181,7 @@ export async function verifyScripts(
     input: ScriptVerifierInput
 ): Promise<ScriptVerifierOutput> {
     const { path, dag, signal } = input;
-    if (signal?.aborted) {
-        throw new MalformedChainError({
-            kind: "UNSUPPORTED",
-            code: "script.aborted",
-            message: "Script verification aborted",
-        });
-    }
+    throwIfAborted(signal);
 
     const checks: CheckResult[] = [];
     const errors: VerificationError[] = [];

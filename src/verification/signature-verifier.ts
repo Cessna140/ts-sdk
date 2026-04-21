@@ -11,7 +11,11 @@ import type {
     SignaturePathEntry,
     Txid,
 } from "./types";
-import { parseSighashFromSchnorrSig, sighashTypeDefault } from "./types";
+import {
+    parseSighashFromSchnorrSig,
+    sighashTypeDefault,
+    txidFromString,
+} from "./types";
 import type { DagAdapter } from "./chain-walker";
 import { aggregateKeys } from "../musig2";
 import {
@@ -22,16 +26,19 @@ import {
 } from "../utils/unknownFields";
 import { TapTreeCoder } from "../script/base";
 import { decodeTapscript, CSVMultisigTapscript } from "../script/tapscript";
+import {
+    bytesEqual,
+    tapTreeMerkleRoot,
+    throwIfAborted,
+    MAX_TAPTREE_BLOB_BYTES,
+} from "./utils";
+
+// ── Public API ──────────────────────────────────────────────────────
 
 /**
- * Typed wrapper for `@scure/btc-signer`'s preimageWitnessV1. The
- * `sighashType` parameter is REQUIRED (no default) — callers must
- * thread the sighash byte parsed out of the 65-byte Schnorr sig
- * (bug B5 from v1 self-review).
- *
- * For script-path spends the caller passes `leafScript` + `leafVersion`
- * so the BIP 341 ext-flag sighash incorporates the tapleaf hash. For
- * key-path spends those are omitted.
+ * Typed wrapper for `@scure/btc-signer`'s preimageWitnessV1.
+ * `sighashType` is REQUIRED — callers must thread the sighash byte
+ * parsed from the Schnorr sig (bug B5 from v1 self-review).
  */
 export function preimageWitnessV1Typed(
     tx: Transaction,
@@ -56,69 +63,49 @@ export function preimageWitnessV1Typed(
 
 export interface SignatureVerifierInput {
     readonly path: readonly SignaturePathEntry[];
-    /**
-     * DAG adapter used by {@link sig.musig2-aggregate-valid} to
-     * iterate every COMMITMENT-parented input — the B3 invariant's
-     * only API for reaching those inputs (no path[length-1] shortcut).
-     */
     readonly dag?: DagAdapter;
     readonly signal?: AbortSignal;
 }
 
 /**
- * Per-tx entry kept around across checks so we don't re-classify
- * inputs between sighash-computed and schnorr-valid.
+ * Runs all four `sig.*` checks on the supplied path. Never throws on
+ * a failed signature — that flips `sig.schnorr-valid`.
  */
+export async function verifySignatures(
+    input: SignatureVerifierInput
+): Promise<readonly CheckResult[]> {
+    const { path, signal } = input;
+    const checks: CheckResult[] = [];
+
+    const { classified, check: classifyCheck } = classifyInputs(path, signal);
+    checks.push(classifyCheck);
+
+    const { checks: schnorrChecks } = verifySighashesAndSchnorr(
+        classified,
+        signal
+    );
+    checks.push(...schnorrChecks);
+
+    checks.push(verifyMusig2Aggregate(path));
+
+    return checks;
+}
+
+// ── Internal types ──────────────────────────────────────────────────
+
 interface ClassifiedEntry {
     readonly entry: SignaturePathEntry;
     readonly txid: Txid;
     readonly kinds: readonly ("key" | "script")[];
 }
 
-function compareBytes(a: Uint8Array, b: Uint8Array): number {
-    const n = Math.min(a.length, b.length);
-    for (let i = 0; i < n; i++) {
-        if (a[i] !== b[i]) return a[i] - b[i];
-    }
-    return a.length - b.length;
+// ── Helpers ─────────────────────────────────────────────────────────
+
+function txidFromTx(tx: Transaction): Txid {
+    return txidFromString(tx.id);
 }
 
-function tapBranchHash(a: Uint8Array, b: Uint8Array): Uint8Array {
-    const [lo, hi] = compareBytes(a, b) <= 0 ? [a, b] : [b, a];
-    return new Uint8Array(schnorr.utils.taggedHash("TapBranch", lo, hi));
-}
-
-/**
- * Compute the BIP 341 taptree merkle root from decoded leaves
- * (BIP 371 `{depth, version, script}[]` format).
- */
-function tapTreeMerkleRoot(
-    leaves: ReadonlyArray<{
-        depth: number;
-        version: number;
-        script: Uint8Array;
-    }>
-): Uint8Array | null {
-    if (leaves.length === 0) return null;
-    const stack: Array<{ depth: number; hash: Uint8Array }> = [];
-    for (const leaf of leaves) {
-        let hash = tapLeafHash(leaf.script, leaf.version);
-        let depth = leaf.depth;
-        while (stack.length > 0 && stack[stack.length - 1].depth === depth) {
-            const sibling = stack.pop()!;
-            hash = tapBranchHash(sibling.hash, hash);
-            depth--;
-        }
-        stack.push({ depth, hash });
-    }
-    return stack.length === 1 ? stack[0].hash : null;
-}
-
-/**
- * Extract the 32-byte x-only pubkey from a P2TR scriptPubKey
- * (OP_1 0x20 <32B>). Throws on non-P2TR shape.
- */
-function p2trXOnlyKey(script: Uint8Array, txid: Txid): Uint8Array {
+function p2trXOnlyKeyOrThrow(script: Uint8Array, txid: Txid): Uint8Array {
     if (script.length !== 34 || script[0] !== 0x51 || script[1] !== 0x20) {
         throw new MalformedChainError({
             kind: "DATA",
@@ -130,46 +117,17 @@ function p2trXOnlyKey(script: Uint8Array, txid: Txid): Uint8Array {
     return script.subarray(2);
 }
 
-function throwIfAborted(signal?: AbortSignal, txid?: Txid): void {
-    if (signal?.aborted) {
-        throw new MalformedChainError({
-            kind: "UNSUPPORTED",
-            code: "sig.aborted",
-            message: `Signature verification aborted (near tx ${txid ?? "?"})`,
-        });
-    }
-}
+// ── Step 1: Classify every input ────────────────────────────────────
 
-/**
- * Runs all four {@link sig.*} checks on the supplied path.
- *
- * Emits (in order):
- *   1. sig.classified — every input routes to key-path or script-path
- *      (UNSUPPORTED for unknown witness shapes).
- *   2. sig.sighash-computed — BIP 341 sighash derived per input.
- *   3. sig.schnorr-valid — every Schnorr sig verifies against its
- *      pubkey + sighash.
- *   4. sig.musig2-aggregate-valid — per COMMITMENT-parented input, if
- *      the PSBT carries Cosigner fields, confirm the aggregated key
- *      matches the batch P2TR internal key. No-cosigners inputs pass
- *      with an "no-data" note (synthetic fixtures have none).
- *
- * Never throws on a failed-sig: that flips {@link sig.schnorr-valid}.
- * Throws {@link MalformedChainError} on structurally unintelligible
- * input, {@link UnsupportedFeatureError} on witness shapes or sighash
- * types we don't implement yet.
- */
-export async function verifySignatures(
-    input: SignatureVerifierInput
-): Promise<readonly CheckResult[]> {
-    const { path, dag, signal } = input;
-    const checks: CheckResult[] = [];
-
-    // ── 1. Classify every input ───────────────────────────────────────
-    const classifyStart = Date.now();
+function classifyInputs(
+    path: readonly SignaturePathEntry[],
+    signal?: AbortSignal
+): { classified: ClassifiedEntry[]; check: CheckResult } {
+    const start = Date.now();
     const classified: ClassifiedEntry[] = [];
     let keyPathCount = 0;
     let scriptPathCount = 0;
+
     for (const entry of path) {
         throwIfAborted(signal);
         if (entry.tx.inputsLength === 0) {
@@ -183,12 +141,13 @@ export async function verifySignatures(
         const kinds: ("key" | "script")[] = [];
         for (let j = 0; j < entry.tx.inputsLength; j++) {
             const inp = entry.tx.getInput(j);
-            const hasKey = !!inp.tapKeySig;
-            const hasScript = !!inp.tapScriptSig && inp.tapScriptSig.length > 0;
-            if (hasKey) {
+            if (inp.tapKeySig) {
                 kinds.push("key");
                 keyPathCount++;
-            } else if (hasScript) {
+            } else if (
+                Array.isArray(inp.tapScriptSig) &&
+                inp.tapScriptSig.length > 0
+            ) {
                 kinds.push("script");
                 scriptPathCount++;
             } else {
@@ -202,264 +161,294 @@ export async function verifySignatures(
         }
         classified.push({ entry, txid, kinds });
     }
-    checks.push({
-        name: "sig.classified",
-        passed: true,
-        details: `${keyPathCount + scriptPathCount} input(s) classified (${keyPathCount} key-path, ${scriptPathCount} script-path)`,
-        durationMs: Date.now() - classifyStart,
-        evidence: {
-            keypath_count: keyPathCount,
-            scriptpath_count: scriptPathCount,
-            sigs_total: keyPathCount + scriptPathCount,
-            path_length: path.length,
-        },
-    });
 
-    // ── 2+3. Compute sighash + verify schnorr — one pass ─────────────
-    const sighashStart = Date.now();
-    let sighashesComputed = 0;
-    let sigsVerified = 0;
-    let sigsFailed = 0;
+    return {
+        classified,
+        check: {
+            name: "sig.classified",
+            passed: true,
+            details: `${keyPathCount + scriptPathCount} input(s) classified (${keyPathCount} key-path, ${scriptPathCount} script-path)`,
+            durationMs: Date.now() - start,
+            evidence: {
+                keypath_count: keyPathCount,
+                scriptpath_count: scriptPathCount,
+                sigs_total: keyPathCount + scriptPathCount,
+                path_length: classified.length,
+            },
+        },
+    };
+}
+
+// ── Steps 2+3: Sighash computation + Schnorr verification ──────────
+
+function verifySighashesAndSchnorr(
+    classified: readonly ClassifiedEntry[],
+    signal?: AbortSignal
+): { checks: [CheckResult, CheckResult] } {
+    const start = Date.now();
+    let computed = 0;
+    let verified = 0;
+    let failed = 0;
     const failDetails: string[] = [];
 
-    for (let i = 0; i < classified.length; i++) {
-        const { entry, txid, kinds } = classified[i];
+    for (const { entry, txid, kinds } of classified) {
         throwIfAborted(signal, txid);
         for (let j = 0; j < kinds.length; j++) {
-            const kind = kinds[j];
             const inp = entry.tx.getInput(j);
 
-            if (kind === "key") {
-                const sig = inp.tapKeySig!;
-                if (sig.length !== 64 && sig.length !== 65) {
-                    throw new MalformedChainError({
-                        kind: "DATA",
-                        code: "sig.bad-sig-length",
-                        message: `Tx ${txid} input ${j} tapKeySig is ${sig.length} bytes (expected 64 or 65)`,
-                        context: { txid, input_index: j, length: sig.length },
-                    });
-                }
-                const sighashType = parseSighashFromSchnorrSig(sig);
-                if (sighashType !== sighashTypeDefault) {
-                    throw new UnsupportedFeatureError({
-                        kind: "UNSUPPORTED",
-                        code: "sig.unsupported-sighash",
-                        message: `Tx ${txid} input ${j} uses sighash ${sighashType.toString(16)} — only SIGHASH_DEFAULT supported in P3`,
-                        context: { txid, input_index: j, sighashType },
-                    });
-                }
-                const sigBytes = sig.subarray(0, 64);
-                const prevoutOfThisInput = entry.perInputPrevouts[j];
-                const pubkey = p2trXOnlyKey(prevoutOfThisInput.script, txid);
-                const msg = preimageWitnessV1Typed(
-                    entry.tx,
-                    j,
-                    entry.perInputPrevouts,
-                    sighashType
-                );
-                sighashesComputed++;
-                if (schnorr.verify(sigBytes, msg, pubkey)) {
-                    sigsVerified++;
-                } else {
-                    sigsFailed++;
-                    failDetails.push(
-                        `${txid} input ${j} key-path sig failed vs pubkey ${hex.encode(pubkey)}`
-                    );
+            if (kinds[j] === "key") {
+                const result = verifyKeyPathSig(entry, txid, j, inp);
+                computed++;
+                if (result.ok) verified++;
+                else {
+                    failed++;
+                    failDetails.push(result.detail);
                 }
             } else {
-                // script-path: iterate every tapScriptSig
-                const tapScriptSig = inp.tapScriptSig;
-                if (!Array.isArray(tapScriptSig) || tapScriptSig.length === 0) {
-                    throw new MalformedChainError({
-                        kind: "DATA",
-                        code: "sig.missing-tapscriptsig",
-                        message: `Tx ${txid} input ${j} script-path missing tapScriptSig`,
-                        context: { txid, input_index: j },
-                    });
-                }
-                const tapLeafScriptField = inp.tapLeafScript;
-                if (
-                    !Array.isArray(tapLeafScriptField) ||
-                    tapLeafScriptField.length === 0
-                ) {
-                    throw new MalformedChainError({
-                        kind: "DATA",
-                        code: "sig.missing-tapleaf-script",
-                        message: `Tx ${txid} input ${j} script-path missing tapLeafScript`,
-                        context: { txid, input_index: j },
-                    });
-                }
-                for (let k = 0; k < tapScriptSig.length; k++) {
-                    const entry_k = tapScriptSig[k];
-                    if (
-                        !Array.isArray(entry_k) ||
-                        entry_k.length < 2 ||
-                        !entry_k[0]?.pubKey ||
-                        !entry_k[0]?.leafHash ||
-                        !(entry_k[1] instanceof Uint8Array)
-                    ) {
-                        throw new MalformedChainError({
-                            kind: "DATA",
-                            code: "sig.malformed-tapscriptsig",
-                            message: `Tx ${txid} input ${j} tapScriptSig[${k}] has unexpected shape`,
-                            context: { txid, input_index: j, k },
-                        });
-                    }
-                    const [meta, sig] = entry_k as [
-                        { pubKey: Uint8Array; leafHash: Uint8Array },
-                        Uint8Array,
-                    ];
-                    if (sig.length !== 64 && sig.length !== 65) {
-                        throw new MalformedChainError({
-                            kind: "DATA",
-                            code: "sig.bad-sig-length",
-                            message: `Tx ${txid} input ${j} tapScriptSig[${k}] is ${sig.length} bytes`,
-                            context: {
-                                txid,
-                                input_index: j,
-                                length: sig.length,
-                            },
-                        });
-                    }
-                    const sighashType = parseSighashFromSchnorrSig(sig);
-                    // Find matching tapLeafScript by leafHash.
-                    let matchedScript: Uint8Array | undefined;
-                    let matchedLeafVersion: number | undefined;
-                    for (const leaf of tapLeafScriptField as ReadonlyArray<
-                        readonly [unknown, Uint8Array]
-                    >) {
-                        if (
-                            !Array.isArray(leaf) ||
-                            !(leaf[1] instanceof Uint8Array) ||
-                            leaf[1].length < 2
-                        )
-                            continue;
-                        const scriptBytes = leaf[1];
-                        // leafHash expected = tapLeafHash(leafVersion, script)
-                        const lv = scriptBytes[scriptBytes.length - 1];
-                        const actualScript = scriptBytes.subarray(
-                            0,
-                            scriptBytes.length - 1
-                        );
-                        const computed = tapLeafHash(actualScript, lv);
-                        if (bytesEqual(computed, meta.leafHash)) {
-                            matchedScript = actualScript;
-                            matchedLeafVersion = lv;
-                            break;
-                        }
-                    }
-                    if (!matchedScript || matchedLeafVersion === undefined) {
-                        throw new MalformedChainError({
-                            kind: "DATA",
-                            code: "sig.leafhash-mismatch",
-                            message: `Tx ${txid} input ${j} tapScriptSig[${k}] leafHash has no matching tapLeafScript`,
-                            context: { txid, input_index: j, k },
-                        });
-                    }
-                    const sigBytes = sig.subarray(0, 64);
-                    // Script-path sighash must include the tapleaf hash —
-                    // pass leafScript + leafVersion through to
-                    // preimageWitnessV1 so BIP 341's ext-flag sighash
-                    // incorporates it.
-                    const msg = preimageWitnessV1Typed(
-                        entry.tx,
-                        j,
-                        entry.perInputPrevouts,
-                        sighashType,
-                        matchedScript,
-                        matchedLeafVersion
-                    );
-                    sighashesComputed++;
-                    if (schnorr.verify(sigBytes, msg, meta.pubKey)) {
-                        sigsVerified++;
-                    } else {
-                        sigsFailed++;
-                        failDetails.push(
-                            `${txid} input ${j} script-path sig[${k}] failed vs pubkey ${hex.encode(meta.pubKey)}`
-                        );
-                    }
-                }
+                const result = verifyScriptPathSigs(entry, txid, j, inp);
+                computed += result.computed;
+                verified += result.verified;
+                failed += result.failed;
+                failDetails.push(...result.failDetails);
             }
         }
     }
 
-    checks.push({
-        name: "sig.sighash-computed",
-        passed: true,
-        details: `Derived ${sighashesComputed} sighash(es) across ${path.length} tx(s)`,
-        durationMs: Date.now() - sighashStart,
-        evidence: {
-            sighashes_computed: sighashesComputed,
-            path_length: path.length,
-        },
-    });
-    const schnorrPassed = sigsFailed === 0;
-    checks.push({
-        name: "sig.schnorr-valid",
-        passed: schnorrPassed,
-        details: schnorrPassed
-            ? `All ${sigsVerified} signature(s) verify`
-            : `${sigsFailed} signature(s) failed: ${failDetails.join("; ")}`,
-        durationMs: 0,
-        evidence: {
-            sigs_verified: sigsVerified,
-            sigs_failed: sigsFailed,
-            sigs_total: sigsVerified + sigsFailed,
-        },
-    });
+    return {
+        checks: [
+            {
+                name: "sig.sighash-computed",
+                passed: true,
+                details: `Derived ${computed} sighash(es) across ${classified.length} tx(s)`,
+                durationMs: Date.now() - start,
+                evidence: {
+                    sighashes_computed: computed,
+                    path_length: classified.length,
+                },
+            },
+            {
+                name: "sig.schnorr-valid",
+                passed: failed === 0,
+                details:
+                    failed === 0
+                        ? `All ${verified} signature(s) verify`
+                        : `${failed} signature(s) failed: ${failDetails.join("; ")}`,
+                durationMs: 0,
+                evidence: {
+                    sigs_verified: verified,
+                    sigs_failed: failed,
+                    sigs_total: verified + failed,
+                },
+            },
+        ],
+    };
+}
 
-    // ── 4. MuSig2 aggregate — verify cosigning scheme ──────────────
-    // For every input that carries CosignerPublicKey PSBT fields,
-    // aggregate the declared keys (BIP 327 KeyAgg via SDK's
-    // aggregateKeys), tweak with the VtxoTaprootTree merkle root,
-    // and compare the result against the parent P2TR output key.
-    // This replicates the upstream validateVtxoTxGraph check
-    // (src/tree/validation.ts:128-148) on our verified path.
-    const aggStart = Date.now();
-    let cosignerInputsChecked = 0;
-    let cosignerInputsMatched = 0;
-    let cosignerInputsNoTree = 0;
+function verifyKeyPathSig(
+    entry: SignaturePathEntry,
+    txid: Txid,
+    j: number,
+    inp: ReturnType<Transaction["getInput"]>
+): { ok: boolean; detail: string } {
+    const sig = inp.tapKeySig!;
+    if (sig.length !== 64 && sig.length !== 65) {
+        throw new MalformedChainError({
+            kind: "DATA",
+            code: "sig.bad-sig-length",
+            message: `Tx ${txid} input ${j} tapKeySig is ${sig.length} bytes`,
+            context: { txid, input_index: j, length: sig.length },
+        });
+    }
+    const sighashType = parseSighashFromSchnorrSig(sig);
+    if (sighashType !== sighashTypeDefault) {
+        throw new UnsupportedFeatureError({
+            kind: "UNSUPPORTED",
+            code: "sig.unsupported-sighash",
+            message: `Tx ${txid} input ${j} uses sighash ${sighashType.toString(16)}`,
+            context: { txid, input_index: j, sighashType },
+        });
+    }
+    const pubkey = p2trXOnlyKeyOrThrow(entry.perInputPrevouts[j].script, txid);
+    const msg = preimageWitnessV1Typed(
+        entry.tx,
+        j,
+        entry.perInputPrevouts,
+        sighashType
+    );
+    const ok = schnorr.verify(sig.subarray(0, 64), msg, pubkey);
+    return {
+        ok,
+        detail: ok
+            ? ""
+            : `${txid} input ${j} key-path sig failed vs pubkey ${hex.encode(pubkey)}`,
+    };
+}
+
+function verifyScriptPathSigs(
+    entry: SignaturePathEntry,
+    txid: Txid,
+    j: number,
+    inp: ReturnType<Transaction["getInput"]>
+): {
+    computed: number;
+    verified: number;
+    failed: number;
+    failDetails: string[];
+} {
+    const tapScriptSig = inp.tapScriptSig;
+    if (!Array.isArray(tapScriptSig) || tapScriptSig.length === 0) {
+        throw new MalformedChainError({
+            kind: "DATA",
+            code: "sig.missing-tapscriptsig",
+            message: `Tx ${txid} input ${j} script-path missing tapScriptSig`,
+            context: { txid, input_index: j },
+        });
+    }
+    const tapLeafScriptField = inp.tapLeafScript;
+    if (!Array.isArray(tapLeafScriptField) || tapLeafScriptField.length === 0) {
+        throw new MalformedChainError({
+            kind: "DATA",
+            code: "sig.missing-tapleaf-script",
+            message: `Tx ${txid} input ${j} script-path missing tapLeafScript`,
+            context: { txid, input_index: j },
+        });
+    }
+
+    let computed = 0;
+    let verified = 0;
+    let failed = 0;
+    const failDetails: string[] = [];
+
+    for (let k = 0; k < tapScriptSig.length; k++) {
+        const pair = tapScriptSig[k];
+        if (
+            !Array.isArray(pair) ||
+            pair.length < 2 ||
+            !pair[0]?.pubKey ||
+            !pair[0]?.leafHash ||
+            !(pair[1] instanceof Uint8Array)
+        ) {
+            throw new MalformedChainError({
+                kind: "DATA",
+                code: "sig.malformed-tapscriptsig",
+                message: `Tx ${txid} input ${j} tapScriptSig[${k}] has unexpected shape`,
+                context: { txid, input_index: j, k },
+            });
+        }
+        const meta = pair[0] as { pubKey: Uint8Array; leafHash: Uint8Array };
+        const sig = pair[1] as Uint8Array;
+
+        if (sig.length !== 64 && sig.length !== 65) {
+            throw new MalformedChainError({
+                kind: "DATA",
+                code: "sig.bad-sig-length",
+                message: `Tx ${txid} input ${j} tapScriptSig[${k}] is ${sig.length} bytes`,
+                context: { txid, input_index: j, length: sig.length },
+            });
+        }
+
+        const { matchedScript, matchedLeafVersion } = findMatchingLeaf(
+            tapLeafScriptField,
+            meta.leafHash,
+            txid,
+            j,
+            k
+        );
+
+        const sighashType = parseSighashFromSchnorrSig(sig);
+        const msg = preimageWitnessV1Typed(
+            entry.tx,
+            j,
+            entry.perInputPrevouts,
+            sighashType,
+            matchedScript,
+            matchedLeafVersion
+        );
+        computed++;
+        if (schnorr.verify(sig.subarray(0, 64), msg, meta.pubKey)) {
+            verified++;
+        } else {
+            failed++;
+            failDetails.push(
+                `${txid} input ${j} script-path sig[${k}] failed vs pubkey ${hex.encode(meta.pubKey)}`
+            );
+        }
+    }
+
+    return { computed, verified, failed, failDetails };
+}
+
+function findMatchingLeaf(
+    tapLeafScriptField: readonly unknown[],
+    leafHash: Uint8Array,
+    txid: Txid,
+    j: number,
+    k: number
+): { matchedScript: Uint8Array; matchedLeafVersion: number } {
+    for (const leaf of tapLeafScriptField) {
+        if (
+            !Array.isArray(leaf) ||
+            !(leaf[1] instanceof Uint8Array) ||
+            leaf[1].length < 2
+        )
+            continue;
+        const scriptBytes = leaf[1] as Uint8Array;
+        const lv = scriptBytes[scriptBytes.length - 1];
+        const actualScript = scriptBytes.subarray(0, scriptBytes.length - 1);
+        if (bytesEqual(tapLeafHash(actualScript, lv), leafHash)) {
+            return { matchedScript: actualScript, matchedLeafVersion: lv };
+        }
+    }
+    throw new MalformedChainError({
+        kind: "DATA",
+        code: "sig.leafhash-mismatch",
+        message: `Tx ${txid} input ${j} tapScriptSig[${k}] leafHash has no matching tapLeafScript`,
+        context: { txid, input_index: j, k },
+    });
+}
+
+// ── Step 4: MuSig2 aggregate — verify cosigning scheme ──────────────
+
+function verifyMusig2Aggregate(
+    path: readonly SignaturePathEntry[]
+): CheckResult {
+    const start = Date.now();
+    let checked = 0;
+    let matched = 0;
+    let noTree = 0;
     let sweepLeavesFound = 0;
     let expiryCrossChecks = 0;
     let expiryMatched = 0;
-    const cosignerFailDetails: string[] = [];
+    const failures: string[] = [];
 
     for (const entry of path) {
         const txid = entry.tx.id as Txid;
         for (let j = 0; j < entry.tx.inputsLength; j++) {
             const cosigners = getArkPsbtFields(entry.tx, j, CosignerPublicKey);
             if (cosigners.length === 0) continue;
-            cosignerInputsChecked++;
+            checked++;
 
-            // aggregateKeys(keys, sort=true) handles BIP 327 key
-            // sorting internally — no pre-sort by index needed.
-            const cosignerKeys = cosigners.map((c) => c.key);
-
-            if (cosignerKeys.some((k) => k.length !== 33)) {
-                cosignerFailDetails.push(
-                    `${txid} input ${j} invalid cosigner key length`
-                );
+            const keys = cosigners.map((c) => c.key);
+            if (keys.some((k) => k.length !== 33)) {
+                failures.push(`${txid} input ${j} invalid cosigner key length`);
                 continue;
             }
 
-            // Read the taptree to derive the sweep merkle root.
             const treeBlobs = getArkPsbtFields(entry.tx, j, VtxoTaprootTree);
-            let merkleRoot: Uint8Array | null = null;
-            let sweepTimelock:
-                | { type: "blocks" | "seconds"; value: bigint }
-                | undefined;
-
-            // Cap taptree blob size to prevent DoS via crafted PSBT.
-            const MAX_TAPTREE_BLOB_BYTES = 100_000;
             if (
                 treeBlobs.length > 0 &&
                 treeBlobs[0].length > MAX_TAPTREE_BLOB_BYTES
             ) {
-                cosignerFailDetails.push(
+                failures.push(
                     `${txid} input ${j} VtxoTaprootTree blob too large (${treeBlobs[0].length} bytes)`
                 );
                 continue;
             }
+
+            let merkleRoot: Uint8Array | null = null;
+            let sweepTimelock:
+                | { type: "blocks" | "seconds"; value: bigint }
+                | undefined;
 
             if (treeBlobs.length > 0) {
                 try {
@@ -471,8 +460,6 @@ export async function verifySignatures(
                         script: Uint8Array;
                     }>;
                     merkleRoot = tapTreeMerkleRoot(decoded);
-
-                    // Identify the sweep leaf (CSVMultisigTapscript).
                     for (const leaf of decoded) {
                         try {
                             const ts = decodeTapscript(leaf.script);
@@ -482,11 +469,11 @@ export async function verifySignatures(
                                 break;
                             }
                         } catch {
-                            // Not a recognised Ark tapscript — skip.
+                            // Not a recognised Ark tapscript.
                         }
                     }
                 } catch {
-                    cosignerFailDetails.push(
+                    failures.push(
                         `${txid} input ${j} VtxoTaprootTree decode failed`
                     );
                     continue;
@@ -494,43 +481,36 @@ export async function verifySignatures(
             }
 
             if (!merkleRoot) {
-                // Real arkd key-path PSBTs carry CosignerPublicKey
-                // but not VtxoTaprootTree. Without the taptree we
-                // cannot verify the aggregate — record as unverifiable
-                // (not a match, not a failure).
-                cosignerInputsNoTree++;
+                // Real arkd key-path PSBTs carry CosignerPublicKey but
+                // not VtxoTaprootTree. Cannot verify without taptree.
+                noTree++;
                 continue;
             }
 
-            // Aggregate cosigner keys with the taptree tweak and
-            // compare against the parent P2TR output key.
             try {
-                const { finalKey } = aggregateKeys(cosignerKeys, true, {
+                const { finalKey } = aggregateKeys(keys, true, {
                     taprootTweak: merkleRoot,
                 });
                 const parentXOnly =
                     entry.perInputPrevouts[j].script.subarray(2);
                 if (parentXOnly.length !== 32) {
-                    cosignerFailDetails.push(
-                        `${txid} input ${j} parent output not P2TR`
-                    );
+                    failures.push(`${txid} input ${j} parent output not P2TR`);
                     continue;
                 }
                 if (bytesEqual(finalKey.subarray(1), parentXOnly)) {
-                    cosignerInputsMatched++;
+                    matched++;
                 } else {
-                    cosignerFailDetails.push(
+                    failures.push(
                         `${txid} input ${j} aggregated key does not match parent P2TR`
                     );
                 }
             } catch (e) {
-                cosignerFailDetails.push(
+                failures.push(
                     `${txid} input ${j} key aggregation failed: ${e instanceof Error ? e.message : String(e)}`
                 );
                 continue;
             }
 
-            // Cross-check sweep timelock against VtxoTreeExpiry.
             if (sweepTimelock) {
                 const expiries = getArkPsbtFields(entry.tx, j, VtxoTreeExpiry);
                 if (expiries.length > 0) {
@@ -542,7 +522,7 @@ export async function verifySignatures(
                     ) {
                         expiryMatched++;
                     } else {
-                        cosignerFailDetails.push(
+                        failures.push(
                             `${txid} input ${j} sweep timelock (${sweepTimelock.type}:${sweepTimelock.value}) != VtxoTreeExpiry (${expiry.type}:${expiry.value})`
                         );
                     }
@@ -551,40 +531,28 @@ export async function verifySignatures(
         }
     }
 
-    const aggPassed = cosignerFailDetails.length === 0;
-    checks.push({
+    return {
         name: "sig.musig2-aggregate-valid",
-        passed: aggPassed,
+        passed: failures.length === 0,
         details:
-            cosignerInputsChecked === 0
+            checked === 0
                 ? "No inputs carry CosignerPublicKey fields"
-                : cosignerFailDetails.length > 0
-                  ? cosignerFailDetails.join("; ")
-                  : cosignerInputsNoTree > 0
-                    ? `${cosignerInputsMatched}/${cosignerInputsChecked} verified; ${cosignerInputsNoTree} skipped (no VtxoTaprootTree)`
-                    : `${cosignerInputsMatched}/${cosignerInputsChecked} aggregated key(s) match parent P2TR`,
-        durationMs: Date.now() - aggStart,
+                : failures.length > 0
+                  ? failures.join("; ")
+                  : noTree > 0
+                    ? `${matched}/${checked} verified; ${noTree} skipped (no VtxoTaprootTree)`
+                    : `${matched}/${checked} aggregated key(s) match parent P2TR`,
+        durationMs: Date.now() - start,
         evidence: {
-            inputs_checked: cosignerInputsChecked,
-            inputs_matched: cosignerInputsMatched,
-            inputs_no_taptree: cosignerInputsNoTree,
+            inputs_checked: checked,
+            inputs_matched: matched,
+            inputs_no_taptree: noTree,
             sweep_leaves_found: sweepLeavesFound,
             expiry_cross_checks: expiryCrossChecks,
             expiry_matched: expiryMatched,
-            mismatches: cosignerFailDetails,
+            mismatches: failures,
         },
-    });
-
-    return checks;
-}
-
-import { equalBytes } from "@scure/btc-signer/utils.js";
-const bytesEqual = equalBytes;
-
-import { txidFromString } from "./types";
-
-function txidFromTx(tx: Transaction): Txid {
-    return txidFromString(tx.id);
+    };
 }
 
 // Re-export types for external consumers via the barrel.

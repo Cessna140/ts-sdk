@@ -13,7 +13,6 @@
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ripemd160 } from "@noble/hashes/legacy.js";
-import { MalformedChainError } from "./errors";
 import { ConditionWitness } from "../utils/unknownFields";
 import type { CheckResult, SignaturePathEntry, Txid } from "./types";
 
@@ -138,8 +137,7 @@ function scanScriptForHashCommitments(
     return found;
 }
 
-import { equalBytes } from "@scure/btc-signer/utils.js";
-const bytesEqual = equalBytes;
+import { bytesEqual, throwIfAborted } from "./utils";
 
 export interface PreimageVerifierInput {
     readonly path: readonly SignaturePathEntry[];
@@ -150,13 +148,7 @@ export async function verifyPreimages(
     input: PreimageVerifierInput
 ): Promise<readonly CheckResult[]> {
     const { path, signal } = input;
-    if (signal?.aborted) {
-        throw new MalformedChainError({
-            kind: "UNSUPPORTED",
-            code: "preimage.aborted",
-            message: "Preimage verification aborted",
-        });
-    }
+    throwIfAborted(signal);
 
     let scriptsScanned = 0;
     const commitments: HashCommitment[] = [];

@@ -23,6 +23,7 @@
 import type { OnchainProvider } from "../providers/onchain";
 import { ProviderUnavailableError } from "./errors";
 import { VtxoTreeExpiry } from "../utils/unknownFields";
+import { throwIfAborted } from "./utils";
 import type {
     BlockHeight,
     CheckResult,
@@ -539,14 +540,4 @@ export async function extractCommitmentExpiryHeights(
         }
     }
     return expiryByCommitment;
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-    if (signal?.aborted) {
-        throw new ProviderUnavailableError({
-            kind: "UNSUPPORTED",
-            code: "anchor.aborted",
-            message: "Anchor verification aborted",
-        });
-    }
 }

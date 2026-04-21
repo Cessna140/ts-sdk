@@ -18,6 +18,7 @@ import { Script } from "@scure/btc-signer/script.js";
 import { MalformedChainError } from "./errors";
 import type { CheckResult, SignaturePathEntry } from "./types";
 import { decodeBip68SequenceBlocks } from "./types";
+import { throwIfAborted } from "./utils";
 
 export const DEFAULT_MIN_CSV_BLOCKS = 1;
 export const DEFAULT_MAX_CSV_BLOCKS = 52_560; // ~1 year at 10 min/block
@@ -98,13 +99,7 @@ export async function verifyTimelocks(
     const minCsv = input.minCsvBlocks ?? DEFAULT_MIN_CSV_BLOCKS;
     const maxCsv = input.maxCsvBlocks ?? DEFAULT_MAX_CSV_BLOCKS;
 
-    if (signal?.aborted) {
-        throw new MalformedChainError({
-            kind: "UNSUPPORTED",
-            code: "timelock.aborted",
-            message: "Timelock verification aborted",
-        });
-    }
+    throwIfAborted(signal);
 
     let fieldsParsed = 0;
     let fieldsFailed = 0;

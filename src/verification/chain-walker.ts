@@ -11,6 +11,7 @@ import {
     txidFromDisplayBytes,
     txidFromString,
 } from "./types";
+import { throwIfAborted } from "./utils";
 
 /**
  * Maximum fee leak across the DAG before `chain.value-conservation` fails.
@@ -868,16 +869,6 @@ function countEdges(g: DagGraph): number {
 function errMessage(e: unknown): string {
     if (e instanceof Error) return e.message;
     return String(e);
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-    if (signal?.aborted) {
-        throw new MalformedChainError({
-            kind: "UNSUPPORTED",
-            code: "chain.aborted",
-            message: "Chain walk was aborted via AbortSignal",
-        });
-    }
 }
 
 async function fetchRawTxs(

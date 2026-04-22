@@ -1286,6 +1286,40 @@ internal key, OP_HASH160 preimage commitment in the claim leaf).
 preimage verifier — addresses §3.2.3's "demonstrate on Boltz"
 requirement without needing a live LN node.
 
+### Sovereign Unilateral Exit (§3.3)
+
+Pre-capture all data needed for a unilateral exit while the ASP is
+available, then execute the exit using only stored data + a Bitcoin node:
+
+```typescript
+import {
+    buildExitBundleFromVtxo,
+    captureExitData,
+    executeUnilateralExit,
+    InMemoryExitDataRepository,
+    EsploraProvider,
+    RestIndexerProvider,
+} from "@arkade-os/sdk";
+
+// Capture (while ASP is available)
+const repo = new InMemoryExitDataRepository();
+await captureExitData(
+    { txid: "...", vout: 0 },
+    new RestIndexerProvider("http://localhost:7070"),
+    new EsploraProvider("http://localhost:3000"),
+    repo,
+    { outputScriptHex: "5120...", feeRate: 1, keyDerivationPath: "m/86'/1'/0'/0/0" }
+);
+
+// Exit (ASP gone — only Bitcoin node needed)
+const result = await executeUnilateralExit({
+    vtxoId: "...:0",
+    repository: repo,
+    onchainProvider: new EsploraProvider("http://localhost:3000"),
+});
+console.log(result.broadcasted, result.steps, result.errors);
+```
+
 ## License
 
 MIT
